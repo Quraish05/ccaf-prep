@@ -37,72 +37,114 @@ const TOOLS = [
 
 ## Code flow
 
-### Tool-use roundtrip (`tool-use-roundtrip*.ts`)
+### Tool-use roundtrip (`tool-use-roundtrip-sdk.ts`)
 
-1. Build the request: `model`, `max_tokens`, `tools` (with `cache_control` on the last entry), and `messages` containing the user question.
-2. Call `POST /v1/messages` with `stream: true`. The raw-fetch version assembles content blocks from SSE events (`content_block_start` → `content_block_delta` → `content_block_stop`); the SDK version delegates that to `client.messages.stream()`.
+> Walkthrough uses the SDK version. The raw-fetch sibling (`tool-use-roundtrip.ts`) follows the same flow; the SSE parser it has to write by hand is shown at the end of this section for reference.
 
-   Hand-rolled SSE parser — the core switch. Text deltas land directly on stdout; `tool_use` inputs arrive as JSON string fragments and only become valid JSON at `content_block_stop`:
+1. Type the request using the SDK's exported types — `Tool[]` for the schema, `MessageParam[]` for the conversation, with `cache_control` on the last tool definition:
 
    ```ts
-   switch (ev.type) {
-     case "message_start":
-       usage = ev.message.usage;
-       break;
-     case "content_block_start":
-       content[ev.index] = ev.content_block.type === "tool_use"
-         ? { ...ev.content_block, input: "" } // accumulate input chars
-         : { ...ev.content_block };
-       break;
-     case "content_block_delta": {
-       const block = content[ev.index];
-       if (ev.delta.type === "text_delta") {
-         block.text += ev.delta.text;
-         process.stdout.write(ev.delta.text);
-       } else if (ev.delta.type === "input_json_delta") {
-         block.input += ev.delta.partial_json;
-       }
-       break;
-     }
-     case "content_block_stop": {
-       const block = content[ev.index];
-       if (block.type === "tool_use") block.input = JSON.parse(block.input || "{}");
-       break;
-     }
-     case "message_delta":
-       if (ev.delta.stop_reason) stop_reason = ev.delta.stop_reason;
-       break;
+   import Anthropic from "@anthropic-ai/sdk";
+   import {
+     MessageParam, Tool, ToolResultBlockParam, ToolUseBlock,
+   } from "@anthropic-ai/sdk/resources/messages/messages.mjs";
+
+   const client = new Anthropic();
+
+   const tools: Tool[] = [
+     {
+       name: "get_weather",
+       description: "Get the current weather for a given location.",
+       input_schema: { /* …object schema with location, unit… */ },
+       cache_control: { type: "ephemeral" }, // caches `tools` across both turns
+     },
+   ];
+
+   const messages: MessageParam[] = [
+     { role: "user", content: "What's the weather in Paris?" },
+   ];
+   ```
+
+2. Open a stream with `client.messages.stream()`. Pipe text deltas to stdout, then `await stream.finalMessage()` for the fully-assembled, typed `Anthropic.Message`:
+
+   ```ts
+   const stream1 = client.messages.stream({
+     model: "claude-opus-4-7", max_tokens: 1024, tools, messages,
+   });
+   stream1.on("text", (delta) => process.stdout.write(delta));
+   const response = await stream1.finalMessage();
+   ```
+
+   `finalMessage()` is what makes the SDK ergonomic — it accumulates content blocks and tool_use inputs for you (the raw-fetch version has to do that by hand; see the SSE parser at the bottom of this section).
+
+3. Inspect `response.stop_reason`. If `"tool_use"`, narrow each `tool_use` block via the typed predicate and build one `tool_result` per call:
+
+   ```ts
+   if (response.stop_reason === "tool_use") {
+     messages.push({ role: "assistant", content: response.content });
+
+     const toolResults: ToolResultBlockParam[] = response.content
+       .filter((b): b is ToolUseBlock => b.type === "tool_use")
+       .map((b) => ({
+         type: "tool_result",
+         tool_use_id: b.id,                                  // ← must match the tool_use block
+         content: runTool(b.name, b.input as Record<string, unknown>),
+       }));
+
+     messages.push({ role: "user", content: toolResults });
    }
    ```
 
-   The SDK does the same thing for you:
+   The `is ToolUseBlock` filter is the TS payoff: inside `.map`, `b` is narrowed so `b.id` / `b.name` / `b.input` are all typed (no `any` casts on the content blocks themselves).
+
+4. Open a second stream with the same `tools`. The identical tool prefix is what makes `cache_control` worth attaching — turn 2 reads from cache if the combined `tools` + `system` prefix crosses 4096 tokens (Opus 4.7's minimum).
 
    ```ts
-   const stream = client.messages.stream({ model, max_tokens, tools, messages });
-   stream.on("text", (delta) => process.stdout.write(delta));
-   const response = await stream.finalMessage(); // typed Anthropic.Message
+   const stream2 = client.messages.stream({
+     model: "claude-opus-4-7", max_tokens: 1024, tools, messages,
+   });
+   stream2.on("text", (delta) => process.stdout.write(delta));
+   response = await stream2.finalMessage();
    ```
 
-3. After the stream ends, inspect `stop_reason`. If `"tool_use"`, locate every `tool_use` block in `content`.
-4. Append the assistant turn (full `content`, including the `tool_use` blocks) to `messages`.
-5. Execute each `tool_use` locally — `runTool(name, input)` returns a string. Build one `tool_result` block per `tool_use` with the matching `tool_use_id`:
+5. Second `finalMessage()` resolves with `stop_reason: "end_turn"`. Print `response.usage` to inspect cache columns: `cache_read_input_tokens` (reads, ~0.1× cost) and `cache_creation_input_tokens` (writes, ~1.25× cost on the 5-minute TTL).
 
-   ```ts
-   messages.push({ role: "assistant", content: response.content });
+#### What the SDK abstracts (raw-fetch variant)
 
-   const toolResults = response.content
-     .filter((b) => b.type === "tool_use")
-     .map((b) => ({
-       type: "tool_result",
-       tool_use_id: b.id,                 // ← must match the tool_use block
-       content: runTool(b.name, b.input), // your handler
-     }));
+`tool-use-roundtrip.ts` replicates `client.messages.stream()` by reading SSE chunks manually. Text deltas land on stdout as they arrive; `tool_use` inputs arrive as JSON string fragments (`input_json_delta.partial_json`) and only become valid JSON at `content_block_stop`. The core switch:
 
-   messages.push({ role: "user", content: toolResults });
-   ```
+```ts
+switch (ev.type) {
+  case "message_start":
+    usage = ev.message.usage; // cache_read/creation_input_tokens land here
+    break;
+  case "content_block_start":
+    content[ev.index] = ev.content_block.type === "tool_use"
+      ? { ...ev.content_block, input: "" } // accumulate input chars
+      : { ...ev.content_block };
+    break;
+  case "content_block_delta": {
+    const block = content[ev.index];
+    if (ev.delta.type === "text_delta") {
+      block.text += ev.delta.text;
+      process.stdout.write(ev.delta.text);
+    } else if (ev.delta.type === "input_json_delta") {
+      block.input += ev.delta.partial_json;
+    }
+    break;
+  }
+  case "content_block_stop": {
+    const block = content[ev.index];
+    if (block.type === "tool_use") block.input = JSON.parse(block.input || "{}");
+    break;
+  }
+  case "message_delta":
+    if (ev.delta.stop_reason) stop_reason = ev.delta.stop_reason;
+    break;
+}
+```
 
-6. Call `/v1/messages` again with the same `tools`. The identical tool prefix is what makes `cache_control` worth attaching — turn 2 reads from cache if the prefix is ≥ 4096 tokens.
-7. Second response streams text and stops at `stop_reason: "end_turn"`. Print `usage` to inspect cache hits.
+Everything else in the raw-fetch flow (appending the assistant turn, building `tool_result` blocks, the second call) is identical — the only difference is the absence of typed content-block narrowing.
 
 ### Structured JSON (`structured-json.ts`)
 

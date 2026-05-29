@@ -1,0 +1,54 @@
+{
+  "description": "5-item eval set for the research orchestrator. Each item is a query plus the content criteria its report must satisfy. The shared_criteria apply to every item (report structure); an item PASSES only if every shared and item-specific criterion passes. Target: >= 4/5 items pass.",
+  "pass_rule": "An item passes iff all shared_criteria AND all of its own criteria are satisfied by the generated report.",
+  "pass_threshold": 4,
+  "shared_criteria": [
+    "Opens with a 2-4 sentence executive summary before the first section heading",
+    "Uses at least 3 markdown section headings (## ...)",
+    "Includes at least 3 inline citations written as [text](url)",
+    "Ends with a '## Sources' section listing the referenced URLs",
+    "Is roughly one page (~400-1200 words): substantive but not bloated"
+  ],
+  "items": [
+    {
+      "id": 1,
+      "query": "compare Pinecone vs Weaviate for hybrid search",
+      "criteria": [
+        "Substantively covers BOTH Pinecone and Weaviate, not just one",
+        "Addresses hybrid search specifically (sparse/BM25 + dense vector fusion), not generic vector similarity"
+      ]
+    },
+    {
+      "id": 2,
+      "query": "compare REST vs gRPC for internal microservice communication",
+      "criteria": [
+        "Covers BOTH REST and gRPC",
+        "Names at least one concrete tradeoff dimension (e.g. performance/streaming, schema + codegen, browser support, or human-readability)"
+      ]
+    },
+    {
+      "id": 3,
+      "query": "when should you choose retrieval-augmented generation over fine-tuning",
+      "criteria": [
+        "Explains BOTH RAG and fine-tuning",
+        "Gives decision criteria for choosing one over the other (e.g. data freshness, cost, domain adaptation, hallucination control)"
+      ]
+    },
+    {
+      "id": 4,
+      "query": "what are the main security risks of connecting to third-party MCP servers",
+      "criteria": [
+        "Identifies at least two distinct risk categories (e.g. prompt injection, credential/token exposure, over-broad tool permissions, supply-chain trust)",
+        "Suggests at least one concrete mitigation"
+      ]
+    },
+    {
+      "id": 5,
+      "query": "how do vector databases implement approximate nearest neighbor search",
+      "criteria": [
+        "Names at least one concrete ANN algorithm or index (e.g. HNSW, IVF, product quantization)",
+        "Explains the accuracy-vs-speed tradeoff ANN makes versus exact nearest-neighbor search"
+      ]
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import type { AgentDefinition } from "@anthropic-ai/claude-agent-sdk";
 
-import { runAgent, type Note } from "../_lib";
+import { runAgent } from "../_lib";
+import type { Note } from "../_types";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;

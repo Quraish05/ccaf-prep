@@ -42,3 +42,6 @@ next-env.d.ts
 
 # generated research reports
 /reports/
+
+# WebSearch audit log
+/audit.jsonl

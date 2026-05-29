@@ -8,7 +8,8 @@ A Next.js + TypeScript demo of the **orchestrator-workers** workflow from Anthro
      the amber "Planner's extended thinking" details visible, and the report streaming in.
      Save the PNG at docs/screenshot.png and this placeholder will resolve. -->
 
-![Research Orchestrator UI](docs/screenshot.png)
+![Research Orchestrator UI](../research-ui.png)
+
 
 ## Architecture
 

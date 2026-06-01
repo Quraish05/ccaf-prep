@@ -2,3 +2,11 @@ node_modules/
 .env
 .env.*
 .DS_Store
+.claude/*
+!.claude/commands/
+!.claude/agents/
+!.claude/output-styles/
+!.claude/hooks/
+!.claude/settings.json
+__pycache__/
+

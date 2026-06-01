@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "CCA Prep Marketplace",
+  "description": "Local marketplace of tooling built during Claude Certified Architect — Foundations prep. One plugin: cca-toolkit, bundling the explain-diff slash command, the security-reviewer sub-agent, and the rm -rf PreToolUse hook.",
+  "version": "0.1.0",
+  "plugins": [
+    {
+      "name": "cca-toolkit",
+      "description": "Slash command (/explain-diff), sub-agent (security-reviewer), and a PreToolUse hook that blocks rm -rf.",
+      "source": "./plugins/cca-toolkit"
+    }
+  ]
+}

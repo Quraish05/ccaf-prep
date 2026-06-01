@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "cca-toolkit",
+  "description": "Slash command + security sub-agent + rm -rf PreToolUse hook, packaged as one installable plugin for the CCA-F prep repo.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Quraish Nagri"
+  }
+}

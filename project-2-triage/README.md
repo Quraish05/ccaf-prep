@@ -15,6 +15,21 @@ A customer-support triage agent built on the **raw `@anthropic-ai/sdk`** with a 
 
 The agent ("Aria") classifies an inbound ticket, looks up the customer, and either issues a refund (≤ $500), escalates (the rest), answers a question, or closes. The final answer is emitted as the validated arguments of a `submit_triage_report` tool call that the model is *forced* to make.
 
+## Why does triage need AI?
+
+A rules-based ticketing system can already keyword-route, look up customers, enforce a refund cap, and log an audit trail. This codebase even ships `classifyTicket()` as a regex stub doing exactly that. So why route this through Claude at all?
+
+The agent earns its keep specifically when:
+
+- **The ticket is paraphrased or ambiguous.** Fixture #13 — *"Trying to decide which one fits us"* — doesn't trip the question regex; a rules-only classifier returns `other`. The model reads context and gets it to `question` → `answered`.
+- **Tone or non-routine signals override the surface category.** Fixture #4 reads as a refund_request, *is* angry, *and* is over-cap. Rules see the refund keyword and would dispatch to `issue_refund`; the model escalates and writes an `escalation_reason` citing the specific trigger ("amount exceeds the $500 cap" *or* "customer threatens chargeback"). Three different triggers would need three different rules; the model handles them as one decision.
+- **Details have to be inferred from context.** A real ticket saying *"the order from last Tuesday"* has no order_id. Rules need every field explicit and fall back to "ask the customer". The model infers from conversation context — or, if it genuinely can't, escalates with a precise reason instead of silently doing nothing (fixture #6 is exactly this case).
+- **The tool path isn't fixed.** Classify → fetch → decide → optional refund → submit-report isn't a single branch. For a question ticket (#11–13) the model skips fetch and refund entirely. For an angry over-cap refund (#4) it skips the refund tool. A rules engine would need explicit if/then for every combination and would fragility-test against every new ticket shape; the agent decides at runtime.
+- **The summary has to read like prose.** The `summary` field is for the human reviewer who picks up the escalation. Mad-Libs from rule outputs (*"Action: REFUND. Customer: cus_001. Amount: $89."*) is fine for machines and ugly for people. The model writes one-paragraph audit prose that's actually readable.
+- **(Day 10) Images carry the signal.** Fixture rows 2 and 10 ship a damage photo and an error screenshot. Pure rules can't tell whether the photo shows real damage or what status code the screenshot contains; vision can.
+
+Where AI *doesn't* help, honestly: tickets with a clear category + explicit amount + explicit order id are mechanically resolvable in 5 lines of TypeScript. The agent is overkill for the easy 30%. The value lives in the long tail of fuzzy / multi-signal / paraphrased / image-bearing tickets — which is what real support inboxes actually look like, and what the eval fixture is designed to test against.
+
 ## What changed
 
 - New Next.js 15 app at `project-2-triage/`.

@@ -2,7 +2,10 @@
 
 > Branch: `feat/project-1-research` · Last updated: 2026-06-01
 
-![Triage inbox demo UI](./screenshot.png)
+![Triage inbox demo UI](../traige-full.png)
+![Triage inbox demo UI](../current-ticket-triage.png)
+![Triage inbox demo UI](../current-ticket-triage-2.png)
+
 
 > Drop the actual capture at `project-2-triage/screenshot.png` to populate this image. Take it against `http://localhost:3000` after running a few tickets so the audit log + result card are visible.
 
@@ -98,23 +101,38 @@ flowchart TD
 
 ## Code walkthrough
 
-Following the path the flowchart draws, in the order events actually fire at runtime.
+Following the path the flowchart draws, in the order events actually fire at runtime. The bulk of the logic lives in `app/api/triage/route.ts`; cross-references to `_lib.ts` and `app/api/audit/stream/route.ts` appear where the route hands off.
 
-### 1. Mint a request id and a fresh MCP client
+### 1. Parse + validate the body, then set up the request
 
 ```ts
 // app/api/triage/route.ts
+let body: { ticket?: unknown };
+try {
+  body = (await req.json()) as { ticket?: unknown };
+} catch {
+  return Response.json({ error: "invalid JSON body" }, { status: 400 });
+}
+
+const ticket = typeof body.ticket === "string" ? body.ticket.trim() : "";
+if (!ticket) {
+  return Response.json(
+    { error: "body must contain { ticket: string }" },
+    { status: 400 },
+  );
+}
+
 const requestId = randomUUID();
 const anthropic = new Anthropic();
 const { client: mcp, close } = await connectRefundsClient();
 ```
 
-`requestId` ties every audit line for this triage to the same UUID so the UI can group them. `connectRefundsClient` builds a *fresh* `McpServer` + `InMemoryTransport` pair per request — the underlying `McpServer` instance isn't re-entrant across concurrent requests, the same lesson Project 1 learned with its parallel searchers.
+Two 400 gates first — bad JSON, then an empty/non-string `ticket`. Then per-request state: a `requestId` UUID that gets stamped on every audit row for grouping, a fresh `Anthropic` client, and a *fresh* MCP client + server pair via `connectRefundsClient`. The MCP server has to be per-request — `McpServer` instances aren't re-entrant across concurrent connections (the lesson Project 1's parallel searchers taught).
 
-### 2. The InMemoryTransport pair *is* the MCP path
+### 2. The MCP wiring — InMemoryTransport pair
 
 ```ts
-// app/api/triage/_lib.ts
+// app/api/triage/_lib.ts — inside connectRefundsClient()
 const server = buildRefundsServer();
 const [clientTransport, serverTransport] =
   InMemoryTransport.createLinkedPair();
@@ -124,12 +142,33 @@ const client = new Client({ name: "triage-agent", version: "1.0.0" });
 await client.connect(clientTransport);
 ```
 
-The `tools: [...]` array Claude sees lists `issue_refund` identically to the inline tools, but its call is round-tripped through real MCP JSON-RPC over an in-memory pipe — proving the path, not collapsing to a direct function call.
+`createLinkedPair()` returns two transports that talk to each other in memory; the server connects to one side and the client connects to the other. The model still sees `issue_refund` as just another entry in `tools: [...]`, but the call gets round-tripped through real MCP JSON-RPC over this in-memory pipe — proving the MCP path rather than collapsing to a direct function call.
 
-### 3. The model call — strict tools, deterministic temperature
+### 3. Per-request observability + initial conversation
 
 ```ts
-// app/api/triage/route.ts
+const toolCalls: ToolCallRecord[] = [];
+const hookBlocks: HookBlock[] = [];
+const preToolUseHook = buildRefundCapHook(hookBlocks);
+
+const messages: Anthropic.MessageParam[] = [
+  { role: "user", content: ticket },
+];
+
+const extractReport = (msg: Anthropic.Message): unknown | null => {
+  const block = msg.content.find(
+    (b): b is Anthropic.ToolUseBlock =>
+      b.type === "tool_use" && b.name === REPORT_TOOL,
+  );
+  return block ? block.input : null;
+};
+```
+
+Two arrays accumulate observability — `toolCalls` ships in the response payload; `hookBlocks` ships separately so the UI can render the red banner without re-scanning. The hook is built fresh per request via the factory so `blocks.push` writes into *this* request's array. The conversation starts with the raw ticket as the user's first message. `extractReport` is a local helper used twice (the normal terminal check and the forced-recovery branch) — finds a `tool_use` block whose name is `submit_triage_report` and returns its already-validated input.
+
+### 4. The model call — strict tools, deterministic temperature
+
+```ts
 const res = await anthropic.messages.create({
   model: "claude-haiku-4-5",
   max_tokens: 2048,
@@ -140,78 +179,184 @@ const res = await anthropic.messages.create({
 });
 ```
 
-`temperature: 0` keeps eval runs reproducible. `TOOLS` ends in `submit_triage_report` which carries `strict: true` and `cache_control: { type: "ephemeral" }` — the strict flag makes the API validate the report's JSON server-side against the schema, the cache marker caches the (large) tools + system across loop turns.
+`temperature: 0` keeps eval runs reproducible — the same ticket should produce the same triage decision. `TOOLS` ends in `submit_triage_report` carrying `strict: true` (API validates the report's JSON server-side against the schema) and `cache_control: { type: "ephemeral" }` (caches the large tools + system prefix across loop turns). The loop body below runs once per turn.
 
-### 4. Terminal check — submit_triage_report wins immediately
+### 5. Terminal check — submit_triage_report wins immediately
 
 ```ts
-const extractReport = (msg: Anthropic.Message): unknown | null => {
-  const block = msg.content.find(
-    (b): b is Anthropic.ToolUseBlock =>
-      b.type === "tool_use" && b.name === REPORT_TOOL,
-  );
-  return block ? block.input : null;
-};
-
 const report = extractReport(res);
 if (report !== null) {
-  return Response.json({ report, tool_calls, hook_blocks, turns, forced_recovery: false });
+  return Response.json({
+    report,
+    tool_calls: toolCalls,
+    hook_blocks: hookBlocks,
+    turns: turn + 1,
+    forced_recovery: false,
+  });
 }
 ```
 
-The report tool's `.input` *is* the validated response — `strict: true` means the schema check has already passed by the time we read it. If the model emits this tool, we return immediately, even if it also emitted other tool_use blocks in the same turn.
+The report tool's `.input` *is* the validated response — `strict: true` means the schema check has already passed. If the model emits this tool, we return immediately, even if it also emitted other tool_use blocks in the same turn — the model has declared the run done.
 
-### 5. PreToolUse hook — the hard cap
+### 6. End-turn fallback — the canonical forced-tool pattern
 
 ```ts
-// app/api/triage/_lib.ts
-if (amount > REFUND_CAP_CENTS) {
-  const reason = `[refund-cap guard] issue_refund blocked: amount_cents=${amount} exceeds the $500 cap (${REFUND_CAP_CENTS}). DO NOT retry issue_refund with a different amount. Conclude this triage by calling submit_triage_report with action_taken="escalated" and an escalation_reason explicitly citing the $500 cap — this refund needs human approval.`;
-  blocks.push({ tool_name, reason, input: redactCardNumbers(tool_input) as Record<string, unknown> });
-  return { decision: "deny", reason };
+if (res.stop_reason === "end_turn") {
+  messages.push({ role: "assistant", content: res.content });
+  messages.push({
+    role: "user",
+    content:
+      "You ended without calling submit_triage_report. Conclude now by calling submit_triage_report with the structured outcome of this triage. Do not call any other tool.",
+  });
+  const forced = await anthropic.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 2048,
+    temperature: 0,
+    system: SYSTEM,
+    tools: TOOLS,
+    messages,
+    tool_choice: {
+      type: "tool",
+      name: REPORT_TOOL,
+      disable_parallel_tool_use: true,
+    },
+  });
+  const forcedReport = extractReport(forced);
+  if (forcedReport === null) {
+    return Response.json(
+      { error: "forced submit_triage_report returned no tool_use block", partial: forced.content, tool_calls: toolCalls },
+      { status: 502 },
+    );
+  }
+  return Response.json({
+    report: forcedReport,
+    tool_calls: toolCalls,
+    hook_blocks: hookBlocks,
+    turns: turn + 2,
+    forced_recovery: true,
+  });
 }
 ```
 
-Defense-in-depth on top of the system prompt's soft cap. The deny `reason` itself is what "forces" the agent to escalate — the model reads the failure message and follows the explicit alternative path.
+Three things make this work and are easy to get wrong:
 
-### 6. Dispatch + audit, in lockstep
+1. **The user message is load-bearing.** You can't re-call `messages.create` after `end_turn` without giving the model something new to respond to — the appended `user` turn is what re-opens the conversation. The text of that turn explains *what* the model has to do.
+2. **`tool_choice: { type: "tool", name: ... }` mandates the named call;** `disable_parallel_tool_use: true` mandates exactly one. Together they're the canonical "structured output via forced tool" pattern.
+3. **The 502 fallback should be unreachable** — `tool_choice: tool` guarantees the call. The guard exists so a future regression surfaces loudly instead of returning a malformed report.
 
-```ts
-// app/api/triage/route.ts
-const output = await dispatchTool(t.name, input, mcp);
-const redactedInput = redactCardNumbers(t.input);
-const path = t.name === "issue_refund" ? "mcp" : "inline";
-toolCalls.push({ path, name: t.name, input: redactedInput, output });
-await appendAudit({
-  ts: new Date().toISOString(),
-  request_id: requestId,
-  kind: "tool_call",
-  tool: t.name,
-  path,
-  input: redactedInput,
-  output_preview: output.slice(0, 200),
-});
-```
-
-The input flows through `redactCardNumbers` *before* it touches either the response payload or the audit log. The file on disk is already PCI-clean — the UI is just rendering the file.
-
-### 7. Forced-recovery branch
+### 7. Unexpected stop_reason → 502
 
 ```ts
-const forced = await anthropic.messages.create({
-  model: "claude-haiku-4-5",
-  max_tokens: 2048,
-  temperature: 0,
-  system: SYSTEM,
-  tools: TOOLS,
-  messages,
-  tool_choice: { type: "tool", name: REPORT_TOOL, disable_parallel_tool_use: true },
-});
+if (res.stop_reason !== "tool_use") {
+  return Response.json(
+    { error: `unexpected stop_reason: ${res.stop_reason}`, partial: res.content, tool_calls: toolCalls },
+    { status: 502 },
+  );
+}
 ```
 
-If the model hits `end_turn` without calling `submit_triage_report`, we re-prompt with a forced tool_choice. `type: "tool"` mandates the named call; `disable_parallel_tool_use: true` mandates exactly one. The response carries `forced_recovery: true` so the UI can flag when this safety net fired.
+After the report-tool and `end_turn` branches, the only `stop_reason` the loop is prepared to handle is `tool_use`. Anything else — `refusal`, `max_tokens`, `pause_turn`, `stop_sequence` — gets surfaced as a 502 with the partial content + the tool trace so far. Failing loudly here is better than entering the dispatch branch with garbage.
 
-### 8. SSE tail of audit.jsonl
+### 8. Normal dispatch — assistant turn first, parallel hook + audit
+
+```ts
+messages.push({ role: "assistant", content: res.content });
+const toolUses = res.content.filter(
+  (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+);
+const toolResults: Anthropic.ToolResultBlockParam[] = await Promise.all(
+  toolUses.map(async (t) => {
+    const input = t.input as Record<string, unknown>;
+
+    const decision = await preToolUseHook({ tool_name: t.name, tool_input: input });
+    if (decision.decision === "deny") {
+      const redactedInput = redactCardNumbers(t.input);
+      toolCalls.push({ path: "hook-denied", name: t.name, input: redactedInput, output: decision.reason });
+      await appendAudit({
+        ts: new Date().toISOString(), request_id: requestId, kind: "hook_block",
+        tool: t.name, path: "hook-denied", hook: "refund-cap",
+        reason: decision.reason, input: redactedInput,
+      });
+      return { type: "tool_result", tool_use_id: t.id, content: decision.reason, is_error: true };
+    }
+
+    const output = await dispatchTool(t.name, input, mcp);
+    const redactedInput = redactCardNumbers(t.input);
+    const path = t.name === "issue_refund" ? "mcp" : "inline";
+    toolCalls.push({ path, name: t.name, input: redactedInput, output });
+    await appendAudit({
+      ts: new Date().toISOString(), request_id: requestId, kind: "tool_call",
+      tool: t.name, path, input: redactedInput,
+      output_preview: output.slice(0, 200),
+    });
+    return { type: "tool_result", tool_use_id: t.id, content: output };
+  }),
+);
+messages.push({ role: "user", content: toolResults });
+```
+
+Four load-bearing details, in order:
+
+1. **Assistant turn first — and push the FULL content array.** `messages.push({ role: "assistant", content: res.content })` appends the entire content array verbatim, not just `.text`. The next request needs the original `tool_use` blocks intact so the `tool_use_id` references in the upcoming `tool_result`s line up. Rebuilding the assistant turn from `.text` alone would silently break the loop.
+2. **`Promise.all` over `toolUses`.** When the model emits multiple `tool_use` blocks in one turn, they run concurrently — hook check, dispatch, and audit append all happen in parallel per call.
+3. **Hook deny path returns `is_error: true`.** The deny `reason` becomes the tool_result's `content`. Setting `is_error: true` tells the model the tool failed; the reason text itself is what tells the model to escalate via `submit_triage_report` rather than retry. The denied call also writes a `hook_block` audit row.
+4. **Path branching at the push site.** `t.name === "issue_refund" ? "mcp" : "inline"` is the only place in the codebase that decides which dispatch path each tool took. That `path` value flows into both the response payload and the audit log, which is how the UI colour-codes the chips.
+
+After the `Promise.all`, the array of `tool_result` blocks becomes one `user` turn and the loop iterates.
+
+### 9. PreToolUse hook — the hard cap (`_lib.ts`)
+
+```ts
+// app/api/triage/_lib.ts — inside buildRefundCapHook()
+return ({ tool_name, tool_input }) => {
+  if (tool_name !== "issue_refund") return { decision: "allow" };
+
+  const amount = tool_input.amount_cents;
+  if (typeof amount !== "number" || !Number.isFinite(amount)) { /* deny + reason */ }
+
+  if (amount > REFUND_CAP_CENTS) {
+    const reason = `[refund-cap guard] issue_refund blocked: amount_cents=${amount} exceeds the $500 cap (${REFUND_CAP_CENTS}). DO NOT retry issue_refund with a different amount. Conclude this triage by calling submit_triage_report with action_taken="escalated" and an escalation_reason explicitly citing the $500 cap — this refund needs human approval.`;
+    blocks.push({ tool_name, reason, input: redactCardNumbers(tool_input) as Record<string, unknown> });
+    return { decision: "deny", reason };
+  }
+  return { decision: "allow" };
+};
+```
+
+Defense-in-depth on top of the system prompt's soft cap. Three branches: allow when the call isn't `issue_refund` (early return); deny when `amount_cents` is missing/malformed; deny when over the cap. The deny `reason` is the prompt back to the model — explicit instructions to escalate via the report tool. The factory shape (closing over a `blocks` array the caller owns) is what makes the hook's behavior observable without parsing message internals.
+
+### 10. Loop cap, error envelope, MCP cleanup
+
+```ts
+// after the for-loop body
+return Response.json(
+  { error: `agent exceeded ${MAX_TURNS} turns without finishing`, tool_calls: toolCalls },
+  { status: 504 },
+);
+
+} catch (err) {
+  if (err instanceof Anthropic.APIError) {
+    return Response.json(
+      { error: err.message, type: err.constructor.name, status: err.status },
+      { status: err.status ?? 500 },
+    );
+  }
+  return Response.json(
+    { error: err instanceof Error ? err.message : String(err) },
+    { status: 500 },
+  );
+} finally {
+  await close();
+}
+```
+
+Three exit conditions:
+
+- **MAX_TURNS exhausted → 504.** The loop is capped at 10 turns to prevent a runaway agent. A gateway-timeout status signals "model didn't reach a terminal in the budget"; the partial `tool_calls` ship so a human can see how far it got.
+- **`Anthropic.APIError` typed catch.** Rate limits (429), auth failures (401), and the rest get their `.status` propagated through — the SDK's typed exception hierarchy means we don't string-match error messages. Anything that isn't an Anthropic error falls through to a generic 500.
+- **`finally { await close() }`.** Runs on every return path — success, error, throw. Closes both the MCP client and the underlying server connected via `InMemoryTransport`, preventing leaked transport handles when the route ends.
+
+### 11. SSE tail of audit.jsonl
 
 ```ts
 // app/api/audit/stream/route.ts
@@ -225,7 +370,7 @@ for (const line of newLines) controller.enqueue(sse(line));
 lastSize = stat.size;
 ```
 
-Position-tracked file tail. On every 500ms tick, we `stat` for growth and read only the new bytes, framing each line as an SSE `data:` event. The UI `<AuditLog>` opens an `EventSource` against this endpoint and renders records as they arrive — the line on the wire is exactly the line on disk.
+Position-tracked file tail. On every 500ms tick, we `stat` for growth and read only the new bytes, framing each line as an SSE `data:` event. The UI `<AuditLog>` opens an `EventSource` against this endpoint and renders records as they arrive — the line on the wire is exactly the line on disk, which means the redaction proof works because nothing in the path between disk and pixel can re-write the input.
 
 ## API reference
 

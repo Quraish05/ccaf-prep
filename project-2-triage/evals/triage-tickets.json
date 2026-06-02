@@ -1,0 +1,122 @@
+{
+  "description": "15-ticket fixture for evaluating /api/triage. Each row pairs a synthetic ticket with the (expected_category, expected_action) the agent should land on once it submits the final report. Items 2 and 10 carry image_url attachments and are the seeds for Day 10 vision work — replace the placeholder URLs with reachable image URLs before running the vision eval.",
+  "policy_anchors": {
+    "refund_cap_cents": 50000,
+    "escalation_triggers": [
+      "refund > $500",
+      "refund_eligible=false",
+      "refund_request with no inferable order_id",
+      "bug_report (any)",
+      "anger / chargeback threat / legal threat / asks for human",
+      "ambiguous 'other' intent"
+    ]
+  },
+  "schemas": {
+    "expected_category": ["refund_request", "bug_report", "question", "other"],
+    "expected_action": ["refund_issued", "escalated", "answered", "closed_no_action"]
+  },
+  "items": [
+    {
+      "id": 1,
+      "ticket": "Hi — I'd like a refund for order ord_4221. The package never arrived (3 weeks late, tracking went silent). Refund the full $89 please. Customer cus_001.",
+      "expected_category": "refund_request",
+      "expected_action": "refund_issued"
+    },
+    {
+      "id": 2,
+      "ticket": "My order ord_993 arrived with visible damage — see the attached photo. Refund $135 please. Customer cus_001.",
+      "image_url": "https://example.com/uploads/cus_001/ord_993_damage.jpg",
+      "expected_category": "refund_request",
+      "expected_action": "refund_issued",
+      "notes": "Vision-eval seed: agent should incorporate the image when assessing damage. Replace placeholder image_url before Day 10 run."
+    },
+    {
+      "id": 3,
+      "ticket": "I was double-billed for my Pro subscription last month — same $29 charge twice on the same day. Refund the duplicate. Order ord_5510, customer cus_001.",
+      "expected_category": "refund_request",
+      "expected_action": "refund_issued"
+    },
+    {
+      "id": 4,
+      "ticket": "I demand a full refund of $4,200 for order ord_9001 — your deployment caused production downtime for our team yesterday. Customer cus_001. This is completely unacceptable.",
+      "expected_category": "refund_request",
+      "expected_action": "escalated",
+      "notes": "Trigger: amount > $500 cap. Note also the angry tone — either trigger alone is sufficient."
+    },
+    {
+      "id": 5,
+      "ticket": "REFUND ME NOW for order ord_111 or I'm disputing this $79 charge with my bank. Customer cus_001.",
+      "expected_category": "refund_request",
+      "expected_action": "escalated",
+      "notes": "Trigger: chargeback threat. Amount is under the cap but the threat alone is sufficient."
+    },
+    {
+      "id": 6,
+      "ticket": "I want my money back. The service has been terrible. Customer cus_001.",
+      "expected_category": "refund_request",
+      "expected_action": "escalated",
+      "notes": "Trigger: refund_request with no order_id and none inferable."
+    },
+    {
+      "id": 7,
+      "ticket": "Please connect me with a human supervisor — I have a complex billing situation I need to walk through with someone. Customer cus_001.",
+      "expected_category": "other",
+      "expected_action": "escalated",
+      "notes": "Trigger: explicit ask for a human."
+    },
+    {
+      "id": 8,
+      "ticket": "I'm contacting my attorney about unauthorized charges on my account. Refund this immediately. Customer cus_001, order ord_4002, $310.",
+      "expected_category": "refund_request",
+      "expected_action": "escalated",
+      "notes": "Trigger: legal threat. Amount is under cap but legal threat is sufficient."
+    },
+    {
+      "id": 9,
+      "ticket": "The dashboard crashes when I click 'Export'. Repro: filter by date range → click Export → page goes white and never recovers. Customer cus_001.",
+      "expected_category": "bug_report",
+      "expected_action": "escalated",
+      "notes": "Trigger: bug_report always escalates per policy."
+    },
+    {
+      "id": 10,
+      "ticket": "Getting 500 errors when calling POST /v1/deployments from my app — see the attached screenshot of the response. Customer cus_004.",
+      "image_url": "https://example.com/uploads/cus_004/api_500_screenshot.png",
+      "expected_category": "bug_report",
+      "expected_action": "escalated",
+      "notes": "Vision-eval seed: agent should use the screenshot to enrich the escalation_reason (e.g. specific status code / endpoint). Replace placeholder image_url before Day 10 run."
+    },
+    {
+      "id": 11,
+      "ticket": "How do I upgrade my Pro plan to Enterprise? Customer cus_001.",
+      "expected_category": "question",
+      "expected_action": "answered"
+    },
+    {
+      "id": 12,
+      "ticket": "Where can I find the billing portal? I need to update the credit card on my account. Customer cus_001.",
+      "expected_category": "question",
+      "expected_action": "answered"
+    },
+    {
+      "id": 13,
+      "ticket": "What's the difference between the Pro and Enterprise tiers? Trying to decide which one fits us. Customer cus_005.",
+      "expected_category": "question",
+      "expected_action": "answered"
+    },
+    {
+      "id": 14,
+      "ticket": "Just wanted to say your support team helped me last week — really appreciated the quick fix. Customer cus_001.",
+      "expected_category": "other",
+      "expected_action": "closed_no_action",
+      "notes": "Positive feedback, no action required."
+    },
+    {
+      "id": 15,
+      "ticket": "Hi, I'm reaching out about a partnership to drive more traffic to your website. Are you interested in a 15-minute call this week?",
+      "expected_category": "other",
+      "expected_action": "closed_no_action",
+      "notes": "Inbound sales spam, not a customer ticket."
+    }
+  ]
+}

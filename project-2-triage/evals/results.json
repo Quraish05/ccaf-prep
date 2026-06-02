@@ -1,0 +1,25 @@
+{
+  "_placeholder": "Placeholder until the Day-9 eval script writes here. The shape matches the EvalResults type in app/api/triage/_types.ts so the MetricsCard renders against real data once the script runs.",
+  "ran_at": "2026-06-01T00:00:00.000Z",
+  "model": "claude-haiku-4-5",
+  "total": 15,
+  "passed": 12,
+  "pass_rate": 0.8,
+  "by_ticket": [
+    { "id": 1, "category_match": true, "action_match": true, "passed": true },
+    { "id": 2, "category_match": true, "action_match": true, "passed": true },
+    { "id": 3, "category_match": true, "action_match": true, "passed": true },
+    { "id": 4, "category_match": true, "action_match": true, "passed": true },
+    { "id": 5, "category_match": true, "action_match": false, "passed": false },
+    { "id": 6, "category_match": true, "action_match": true, "passed": true },
+    { "id": 7, "category_match": false, "action_match": true, "passed": false },
+    { "id": 8, "category_match": true, "action_match": true, "passed": true },
+    { "id": 9, "category_match": true, "action_match": true, "passed": true },
+    { "id": 10, "category_match": true, "action_match": true, "passed": true },
+    { "id": 11, "category_match": true, "action_match": true, "passed": true },
+    { "id": 12, "category_match": true, "action_match": true, "passed": true },
+    { "id": 13, "category_match": true, "action_match": true, "passed": true },
+    { "id": 14, "category_match": true, "action_match": true, "passed": true },
+    { "id": 15, "category_match": false, "action_match": false, "passed": false }
+  ]
+}

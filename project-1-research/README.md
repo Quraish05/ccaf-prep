@@ -58,7 +58,7 @@ flowchart LR
   DL --> REPORTS
 ```
 
-All four request-driven entrypoints (`/api/research/chat`, `/api/research`, `/api/research/eval`, `/api/research/test-pii`) share the same `runResearch()` function in `app/api/research/_lib.ts`. The only differences between them are the **profile** (`PROD_PROFILE` = Sonnet/Opus, `FAST_PROFILE` = Haiku-everywhere with capped turns) and what they emit — JSON, streamed UIMessage parts, or judge scores. `runResearch` itself runs the planner via the raw `@anthropic-ai/sdk` (one tool-less call, no point spawning a CLI subprocess), then fans out searcher sub-agents via the Claude Agent SDK with a fresh in-process MCP server per `query()` call (the underlying `McpServer` instance isn't re-entrant across concurrent connections — every server closes over the same `notes` array so the shared writeboard semantics survive), then runs the synthesizer.
+All four request-driven entrypoints (`/api/research/chat`, `/api/research`, `/api/research/eval`, `/api/research/test-pii`) share the same `runResearch()` function in `app/api/research/_lib.ts`. The only differences between them are the **profile** and what they emit. Both profiles currently default to **Haiku across every role** for cost; `PROD_PROFILE` keeps extended thinking on the planner and runs uncapped, while `FAST_PROFILE` caps searcher turns and sub-query count for cheap eval re-runs. The profile structure still supports per-stage model overrides — flipping any role to Sonnet or Opus is a one-line change on `_lib.ts`. `runResearch` itself runs the planner via the raw `@anthropic-ai/sdk` (one tool-less call, no point spawning a CLI subprocess), then fans out searcher sub-agents via the Claude Agent SDK with a fresh in-process MCP server per `query()` call (the underlying `McpServer` instance isn't re-entrant across concurrent connections — every server closes over the same `notes` array so the shared writeboard semantics survive), then runs the synthesizer.
 
 ## Backend, in execution order
 
@@ -348,7 +348,7 @@ Open <http://localhost:3000>, type a research query, hit **Send**. The first run
 
 **3. Or hit the JSON / eval / test routes directly:**
 ```bash
-# Full Sonnet/Opus orchestration (slower, better quality):
+# Full JSON one-shot orchestration (PROD profile, uncapped, Haiku):
 curl -X POST localhost:3000/api/research \
   -H 'Content-Type: application/json' \
   -d '{"query":"compare Pinecone vs Weaviate for hybrid search"}'
@@ -364,7 +364,7 @@ curl -X POST localhost:3000/api/research/test-pii | jq '.verdict'
 
 | Method | Route | Purpose |
 |---|---|---|
-| POST | `/api/research` | One-shot JSON. Runs `runResearch` on the **PROD** profile (Sonnet searchers, Opus synth, extended thinking on the planner). Returns the full payload (sub-queries, notes, report, report_path, pii_blocks). |
+| POST | `/api/research` | One-shot JSON. Runs `runResearch` on the **PROD** profile (Haiku across all roles, extended thinking on the planner, uncapped searcher turns). Returns the full payload (sub-queries, notes, report, report_path, pii_blocks, citations). |
 | POST | `/api/research/chat` | Streaming UIMessage endpoint consumed by `useChat`. Runs on the **FAST** profile (Haiku). Emits `tool-*` parts per pipeline stage, `reasoning-*` for the planner's thinking, and the report as `text-*`. |
 | POST | `/api/research/eval` | Loops `evals/research-evals.json` items through `runResearch` (FAST profile), runs a Haiku LLM-judge against each report's criteria, returns per-criterion pass/fail + aggregate score. Accepts `{ ids: number[] }` to run a subset. |
 | POST | `/api/research/test-pii` | Single-agent reproduction of the PII hook: prompts an agent to save a PII-laden note, asserts the hook denies + the agent recovers with `[REDACTED]`. |

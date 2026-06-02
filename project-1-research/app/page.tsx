@@ -102,14 +102,18 @@ function MessageCard({ message }: { message: UIMessage }) {
   const synthPart = toolParts.find(
     (p) => getToolName(p) === "synthesize" && p.state === "output-available",
   );
-  const filename =
-    synthPart &&
-    "output" in synthPart &&
-    synthPart.output &&
-    typeof synthPart.output === "object" &&
-    "filename" in synthPart.output
-      ? String((synthPart.output as { filename: unknown }).filename)
+  const synthOutput =
+    synthPart && "output" in synthPart && synthPart.output && typeof synthPart.output === "object"
+      ? (synthPart.output as Record<string, unknown>)
       : null;
+  const filename =
+    synthOutput && "filename" in synthOutput
+      ? String(synthOutput.filename)
+      : null;
+  const citations: Citation[] =
+    synthOutput && Array.isArray(synthOutput.citations)
+      ? (synthOutput.citations as Citation[])
+      : [];
 
   return (
     <article
@@ -153,9 +157,50 @@ function MessageCard({ message }: { message: UIMessage }) {
       )}
 
       {text && (
-        <pre className="whitespace-pre-wrap text-sm leading-relaxed">
-          {text}
-        </pre>
+        <div className="whitespace-pre-wrap text-sm leading-relaxed">
+          {renderReportWithCitationLinks(text)}
+        </div>
+      )}
+
+      {citations.length > 0 && (
+        <section className="mt-4 border-t border-zinc-200 pt-3 dark:border-zinc-800">
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
+            Sources
+          </h3>
+          <ol className="space-y-1.5 text-xs">
+            {citations.map((c) => (
+              <li
+                key={c.number}
+                id={`cite-${c.number}`}
+                className="text-zinc-700 dark:text-zinc-300"
+              >
+                <span className="mr-1 font-mono text-zinc-500">
+                  [{c.number}]
+                </span>
+                {c.source_url ? (
+                  <a
+                    href={c.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-700 hover:underline dark:text-blue-400"
+                  >
+                    {c.title}
+                  </a>
+                ) : (
+                  <span>{c.title}</span>
+                )}
+                {c.cited_text && (
+                  <div className="ml-6 mt-0.5 italic text-zinc-500">
+                    &ldquo;
+                    {c.cited_text.slice(0, 200)}
+                    {c.cited_text.length > 200 ? "…" : ""}
+                    &rdquo;
+                  </div>
+                )}
+              </li>
+            ))}
+          </ol>
+        </section>
       )}
 
       {filename && (
@@ -197,6 +242,36 @@ function TraceRow({ part }: { part: ToolUIPart }) {
       </span>
     </li>
   );
+}
+
+// Citation shape carried on the synth tool's output — kept in sync with
+// the server-side `Citation` type in app/api/research/_types.ts.
+type Citation = {
+  number: number;
+  source_url: string | null;
+  title: string;
+  cited_text: string;
+};
+
+// Turn literal "[N]" footnote markers in the report body into anchor links
+// that scroll to the matching <li id="cite-N"> in the Sources section.
+function renderReportWithCitationLinks(text: string) {
+  const parts = text.split(/(\[\d+\])/g);
+  return parts.map((part, i) => {
+    const m = part.match(/^\[(\d+)\]$/);
+    if (m) {
+      return (
+        <a
+          key={i}
+          href={`#cite-${m[1]}`}
+          className="text-blue-700 no-underline hover:underline dark:text-blue-400"
+        >
+          {part}
+        </a>
+      );
+    }
+    return <span key={i}>{part}</span>;
+  });
 }
 
 function pillFor(state: ToolUIPart["state"]): {

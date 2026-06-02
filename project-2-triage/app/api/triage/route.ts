@@ -26,9 +26,9 @@ import {
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
-  let body: { ticket?: unknown };
+  let body: { ticket?: unknown; image_url?: unknown };
   try {
-    body = (await req.json()) as { ticket?: unknown };
+    body = (await req.json()) as { ticket?: unknown; image_url?: unknown };
   } catch {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
   }
@@ -40,6 +40,38 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
+
+  // Optional image attachment — vision branch. When provided we send the
+  // user message as a content array with the image FIRST (Anthropic best
+  // practice: image-then-text) so the model sees the visual context before
+  // the textual claim.
+  //
+  // Accepts two URL flavors via the same `image_url` field:
+  //   - http(s):// URL → forwarded as { type: "url" } source. Anthropic
+  //     fetches it server-side. CAVEAT: their fetcher respects robots.txt,
+  //     so most public image hosts (wikimedia, placehold.co, etc.) fail
+  //     with 400 "disallowed by robots.txt". Works for hosts you control.
+  //   - data:image/<type>;base64,<data> → parsed locally into a
+  //     { type: "base64" } source. Always works (no server-side fetch),
+  //     at the cost of more bytes on the wire. Required for Bedrock/Vertex.
+  const imageUrl =
+    typeof body.image_url === "string" && body.image_url.trim().length > 0
+      ? body.image_url.trim()
+      : null;
+
+  const buildImageSource = (
+    src: string,
+  ): Anthropic.Base64ImageSource | Anthropic.URLImageSource => {
+    const m = src.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+    if (m) {
+      return {
+        type: "base64",
+        media_type: m[1] as Anthropic.Base64ImageSource["media_type"],
+        data: m[2],
+      };
+    }
+    return { type: "url", url: src };
+  };
 
   const requestId = randomUUID();
   const anthropic = new Anthropic();
@@ -54,8 +86,15 @@ export async function POST(req: Request) {
   const hookBlocks: HookBlock[] = [];
   const preToolUseHook = buildRefundCapHook(hookBlocks);
 
+  const userContent: Anthropic.ContentBlockParam[] | string = imageUrl
+    ? [
+        { type: "image", source: buildImageSource(imageUrl) },
+        { type: "text", text: ticket },
+      ]
+    : ticket;
+
   const messages: Anthropic.MessageParam[] = [
-    { role: "user", content: ticket },
+    { role: "user", content: userContent },
   ];
 
   // Helper: pull the structured payload out of a forced submit_triage_report

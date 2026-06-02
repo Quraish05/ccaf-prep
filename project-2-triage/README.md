@@ -39,7 +39,7 @@ Where AI *doesn't* help, honestly: tickets with a clear category + explicit amou
 - `app/api/audit/stream/route.ts` — SSE endpoint that tails `audit.jsonl` for the `<AuditLog>` UI.
 - `app/page.tsx` — Server Component: reads fixture + eval results from disk, composes the shell.
 - `app/_components/{MetricsCard,TriageInbox,AuditLog}.tsx` — UI pieces.
-- `evals/triage-tickets.json` — 15-ticket fixture (`expected_category` + `expected_action`); items 2 and 10 carry `image_url` for Day-10 vision.
+- `evals/triage.jsonl` + `evals/triage.eval.json` + `evals/README.md` — Inspect-style eval (one sample per line in the JSONL: `{input, target, metadata}`; task spec in the `.eval.json`). Items 2 and 10 carry `image_url` for Day-10 vision. `page.tsx` reads the JSONL and flattens each sample for the UI's left rail.
 - `evals/results.json` — placeholder pass-rate; the Day-9 eval script will overwrite this.
 
 ## Eval results
@@ -424,7 +424,7 @@ Position-tracked file tail. On every 500ms tick, we `stat` for growth and read o
 | `PreToolUseHook` | The hook signature: `(input) => PreToolUseDecision \| Promise<...>`. |
 | `HookBlock` | Observed denial record (the factory closes over an array of these). |
 | `ToolCallRecord` | One row in the post-dispatch trace; carries `path` so callers see which path the tool took. |
-| `TicketFixtureItem` | One row in `evals/triage-tickets.json`. |
+| `TicketFixtureItem` | Flattened ticket row used by the UI. `page.tsx` parses `evals/triage.jsonl` (Inspect-style `{input, target, metadata}`) and reshapes each sample into this flat form for `TriageInbox`. The eval route reads the JSONL directly. |
 | `EvalResults` | Shape the Day-9 eval script writes to `evals/results.json`. |
 | `AuditRecord` | One JSONL line in `audit.jsonl`. Two `kind`s: `tool_call` or `hook_block`. |
 
@@ -440,6 +440,33 @@ Position-tracked file tail. On every 500ms tick, we `stat` for growth and read o
 - **SSE (Server-Sent Events)** — One-way streaming over HTTP. Plain `text/event-stream` body with `data: <line>\n\n` frames. The `<AuditLog>` UI consumes it via the browser `EventSource` API.
 - **Audit log** — Append-only `audit.jsonl` at the project root. One JSON line per tool call or hook block, written *after* redaction. The SSE endpoint tails this file; the UI is just rendering what's on disk.
 - **Forced-recovery** — The `forced_recovery: true` flag in the response means the model tried to `end_turn` without calling `submit_triage_report`, and the route had to re-call with `tool_choice: tool` to coerce the structured output.
+
+## Recall check
+
+### Name three mitigations for prompt injection, ranked by strength
+
+Prompt injection is when untrusted content (a user message, a tool output, a fetched web page, an attached doc) carries instructions that try to override the system prompt or trick the model into doing something the harness wouldn't authorise. Ranked strongest → weakest by **where the defence lives**:
+
+1. **Harness-level capability isolation (strongest).** The model can't do the bad thing because the *harness* won't let it. Tool allowlists on the agent definition (the `tools: [...]` array literally bounds the set of calls Claude can emit), **`PreToolUse` hooks** that deny by policy regardless of what the model emits (this codebase's `buildRefundCapHook` makes the $500 cap a hard rule, not a prompt suggestion), permission policies (`always_ask` for sensitive tools), and sub-agent capability separation (project-1's synthesizer can only `read`; only the searcher can write notes; only the route can issue refunds). Strongest because it does not depend on the model behaving correctly — even if the model is fully manipulated, the harness refuses to act.
+
+2. **Output validation at the API boundary (middle).** The model produces output; the harness validates it before doing anything with it. `strict: true` on a tool definition makes the API enforce the JSON schema server-side — the model literally cannot return a malformed refund. Canary checks (embed a known secret in the system prompt and assert it never appears in output) detect data-exfiltration attempts. A separate evaluator model can grade the output against the system prompt's intent before it reaches the user. Weaker than capability isolation because it's *reactive* — it catches some attacks but not subtle ones where the output is well-formed but wrong (e.g. a refund issued within the cap but with a fabricated reason).
+
+3. **Prompt-side hardening + input delimiting (weakest).** Tell the model in the system prompt to ignore instructions inside user content; structurally separate trusted instructions from untrusted data (wrap user content in `<user_content>...</user_content>` tags, send tool results as `tool_result` blocks rather than concatenating into the user turn). The model usually follows these conventions, but a sophisticated injection — especially one that mimics the system prompt's tone, or hides in an image / PDF / web page — can still trick it. Weakest because it relies on the model's training to respect the separation; that respect is not a hard guarantee.
+
+Defence in depth means using all three. This codebase has Tier 1 (refund-cap hook) and Tier 2 (`strict: true` on the report tool). Tier 3 only matters once untrusted content enters the loop — when a later project adds RAG over support docs, the system prompt will need explicit `<retrieved_doc>...</retrieved_doc>` delimiting and an instruction-vs-data segregation rule.
+
+### Citations vs. appending sources to the prompt
+
+**Appending sources** is the "stuff the docs into a user message and ask the model to cite them" approach. Project-1's research synthesizer uses it: each searcher writes `Note` entries with a `source_url`, the synthesizer reads them via `mcp__notes__recent_notes`, and is *prompted* to emit inline `[text](url)` citations. The model can — and sometimes does — fabricate a quote, attribute it to the wrong source, or paraphrase wrongly. There's no programmatic check that the cited text actually appears in the cited source; you trust the model.
+
+**Anthropic Citations** (the first-party API feature, `documents: [...]` with `citations: { enabled: true }`) is structurally different:
+
+- Source documents are passed as a typed `documents` array on the request, **not** concatenated into prose. The model sees them as a separate field.
+- The response includes structured `citation` blocks. Each citation carries `document_index`, `start_char_index` / `end_char_index` (or `start_block_index` / `end_block_index` for chunked docs), and the exact `cited_text` from the source.
+- Citations are **grounded** by the API: the model can only cite spans that actually appear in the documents you provided. The API rejects fabricated citations server-side — the model cannot make up an offset.
+- You get back machine-readable data (indices + offsets), not free-text claims. A UI can render highlighted source spans, a verifier can programmatically diff `cited_text` against the original document, and a logging pipeline can store the citation graph alongside the answer.
+
+The cost difference: appending sources is cheaper to prototype — works with any model, any provider, any host — and produces nicer-looking output for demos. Citations require a Citations-capable Anthropic model and the first-party API. But Citations is the difference between *"the model says this came from doc 3"* and *"byte range 1240–1387 of doc 3 says this verbatim"*. For anything where misattribution is a liability — legal answers, medical summaries, RAG search results, any user-facing claim that has to be auditable — Citations is the right primitive; appending sources is a prototype shortcut.
 
 ## Run
 

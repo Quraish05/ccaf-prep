@@ -1,20 +1,25 @@
 // Eval harness for /api/triage.
 //
-// Loads evals/triage-tickets.json, fetches /api/triage per item (same dev
-// server — uses the incoming request's origin), and rule-scores each
-// returned report on three axes:
+// Reads two files following the Inspect convention:
 //
-//   (a) routing  — report.ticket_category === expected_category
-//   (b) action   — report.action_taken === expected_action
-//   (c) policy   — internal consistency of the structured output against
-//                  the system prompt's "Final-output contract": refund
-//                  presence matches action, no >$500 refund slips past
-//                  the hook, refund_issued requires category=refund_request,
-//                  etc.
+//   evals/triage.eval.json  — task spec (name, scorers, pass criteria,
+//                              policy_anchors, schemas, threshold).
+//   evals/triage.jsonl      — one sample per line, each shaped as
+//                              { id, input, target, metadata }.
 //
-// An item passes only if all three axes are clean. Body accepts an optional
+// `input` is sent verbatim as the POST body to /api/triage on the same
+// dev server (the incoming request's origin). The response is scored on
+// three code-based scorers:
+//
+//   (a) category_match    — report.ticket_category === target.category
+//   (b) action_match      — report.action_taken === target.action
+//   (c) policy_violations — internal-consistency rules vs. the system
+//                            prompt's "Final-output contract" + the
+//                            refund_cap_cents anchor in the spec.
+//
+// An item passes only if all three are clean. The aggregate threshold
+// is read from the spec (currently 12/16). Body accepts an optional
 // { ids: number[] } to re-run a subset cheaply during prompt iteration.
-// Target threshold: 12/15.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -22,22 +27,27 @@ import path from "node:path";
 export const runtime = "nodejs";
 export const maxDuration = 600;
 
-type Ticket = {
+type Category = "refund_request" | "bug_report" | "question" | "other";
+type Action =
+  | "refund_issued"
+  | "escalated"
+  | "answered"
+  | "closed_no_action";
+
+type Sample = {
   id: number;
-  ticket: string;
-  image_url?: string;
-  expected_category: "refund_request" | "bug_report" | "question" | "other";
-  expected_action:
-    | "refund_issued"
-    | "escalated"
-    | "answered"
-    | "closed_no_action";
-  notes?: string;
+  input: { ticket: string; image_url?: string };
+  target: { category: Category; action: Action };
+  metadata?: { notes?: string };
 };
 
-type Fixture = {
-  policy_anchors: { refund_cap_cents: number };
-  items: Ticket[];
+type EvalSpec = {
+  name: string;
+  version: number;
+  description: string;
+  dataset: string;
+  policy_anchors: { refund_cap_cents: number; escalation_triggers: string[] };
+  pass_criteria: { aggregate: { passed_at_least: number; of: number } };
 };
 
 type TriageReport = {
@@ -78,20 +88,30 @@ type ItemResult = {
   error?: string;
 };
 
-async function loadFixture(): Promise<Fixture> {
-  const p = path.join(process.cwd(), "evals", "triage-tickets.json");
-  return JSON.parse(await fs.readFile(p, "utf8")) as Fixture;
+async function loadSpec(): Promise<EvalSpec> {
+  const p = path.join(process.cwd(), "evals", "triage.eval.json");
+  return JSON.parse(await fs.readFile(p, "utf8")) as EvalSpec;
 }
 
-function score(item: Ticket, resp: TriageResponse, cap: number): ItemResult {
+async function loadDataset(datasetRelPath: string): Promise<Sample[]> {
+  const p = path.join(process.cwd(), "evals", datasetRelPath);
+  const raw = await fs.readFile(p, "utf8");
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as Sample);
+}
+
+function score(sample: Sample, resp: TriageResponse, cap: number): ItemResult {
   const r = resp.report ?? {};
   const cat = r.ticket_category ?? null;
   const act = r.action_taken ?? null;
 
   const violations: string[] = [];
 
-  // (c1) Refund cap — should never leak past the hook, but verify any
-  //      successfully-dispatched issue_refund call respected the $500 cap.
+  // Refund cap — should never leak past the hook, but verify any
+  // successfully-dispatched issue_refund call respected the cap.
   for (const call of resp.tool_calls ?? []) {
     if (
       call.name === "issue_refund" &&
@@ -107,7 +127,7 @@ function score(item: Ticket, resp: TriageResponse, cap: number): ItemResult {
     }
   }
 
-  // (c2) Final-output contract: action ⇔ refund/escalation_reason presence.
+  // Final-output contract: action ⇔ refund/escalation_reason presence.
   if (act === "refund_issued") {
     if (!r.refund) {
       violations.push("action=refund_issued but report.refund is null");
@@ -117,7 +137,6 @@ function score(item: Ticket, resp: TriageResponse, cap: number): ItemResult {
         "action=refund_issued but escalation_reason is non-null",
       );
     }
-    // amount_cents inside report.refund must also be within the cap.
     const amt = r.refund?.amount_cents;
     if (typeof amt === "number" && amt > cap) {
       violations.push(
@@ -138,35 +157,31 @@ function score(item: Ticket, resp: TriageResponse, cap: number): ItemResult {
       violations.push(`action=${act} but report.refund is non-null`);
     }
     if (r.escalation_reason) {
-      violations.push(
-        `action=${act} but escalation_reason is non-null`,
-      );
+      violations.push(`action=${act} but escalation_reason is non-null`);
     }
   }
 
-  // (c3) Category-action consistency: refund_issued requires the category
-  //      to be refund_request — anything else means the agent issued a
-  //      refund against a non-refund ticket.
+  // Category-action consistency.
   if (act === "refund_issued" && cat !== "refund_request") {
     violations.push(
       `action=refund_issued but ticket_category=${cat} (expected refund_request)`,
     );
   }
 
-  // (c4) submit_triage_report must have been called — i.e. report exists.
+  // submit_triage_report must have been called — i.e. report exists.
   if (!resp.report) {
     violations.push("agent never called submit_triage_report");
   }
 
-  const correct_category = cat === item.expected_category;
-  const correct_action = act === item.expected_action;
+  const correct_category = cat === sample.target.category;
+  const correct_action = act === sample.target.action;
   const passed =
     correct_category && correct_action && violations.length === 0;
 
   return {
-    id: item.id,
-    expected_category: item.expected_category,
-    expected_action: item.expected_action,
+    id: sample.id,
+    expected_category: sample.target.category,
+    expected_action: sample.target.action,
     actual_category: cat,
     actual_action: act,
     correct_category,
@@ -182,28 +197,30 @@ export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as { ids?: unknown };
   const ids = Array.isArray(body.ids) ? body.ids.map(Number) : null;
 
-  const fixture = await loadFixture();
-  const cap = fixture.policy_anchors.refund_cap_cents;
-  const items = ids ? fixture.items.filter((it) => ids.includes(it.id)) : fixture.items;
+  const spec = await loadSpec();
+  const dataset = await loadDataset(spec.dataset);
+  const cap = spec.policy_anchors.refund_cap_cents;
+  const threshold = spec.pass_criteria.aggregate.passed_at_least;
+  const samples = ids ? dataset.filter((s) => ids.includes(s.id)) : dataset;
 
   const origin = new URL(req.url).origin;
   const results: ItemResult[] = [];
 
   // Sequential — the triage route opens a fresh MCP transport per request;
   // running them in parallel works but makes failures harder to read.
-  for (const item of items) {
+  for (const sample of samples) {
     try {
       const r = await fetch(`${origin}/api/triage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ticket: item.ticket }),
+        body: JSON.stringify(sample.input),
       });
       const data = (await r.json()) as TriageResponse;
       if (!r.ok || data.error) {
         results.push({
-          id: item.id,
-          expected_category: item.expected_category,
-          expected_action: item.expected_action,
+          id: sample.id,
+          expected_category: sample.target.category,
+          expected_action: sample.target.action,
           actual_category: null,
           actual_action: null,
           correct_category: false,
@@ -214,12 +231,12 @@ export async function POST(req: Request) {
         });
         continue;
       }
-      results.push(score(item, data, cap));
+      results.push(score(sample, data, cap));
     } catch (err) {
       results.push({
-        id: item.id,
-        expected_category: item.expected_category,
-        expected_action: item.expected_action,
+        id: sample.id,
+        expected_category: sample.target.category,
+        expected_action: sample.target.action,
         actual_category: null,
         actual_action: null,
         correct_category: false,
@@ -232,8 +249,8 @@ export async function POST(req: Request) {
   }
 
   const passed = results.filter((r) => r.passed).length;
-  const threshold = 12;
   return Response.json({
+    eval: { name: spec.name, version: spec.version },
     threshold,
     total: results.length,
     passed,

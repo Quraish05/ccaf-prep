@@ -18,15 +18,36 @@ import type {
 // between page loads, and we want the metric to reflect the latest run.
 export const dynamic = "force-dynamic";
 
-type FixtureFile = {
-  items: TicketFixtureItem[];
+// JSONL sample shape (Inspect-style): { input, target, metadata? }.
+// Lives at evals/triage.jsonl alongside evals/triage.eval.json (task spec).
+type TriageSample = {
+  id: number;
+  input: { ticket: string; image_url?: string };
+  target: { category: string; action: string };
+  metadata?: { notes?: string };
 };
 
+// Load the dataset and FLATTEN each sample back to TicketFixtureItem's flat
+// shape so the existing UI (TriageInbox + the props) doesn't need to know
+// about the Inspect layout. The flat form is purely a UI convenience —
+// the eval route reads triage.jsonl directly.
 async function loadFixture(): Promise<TicketFixtureItem[]> {
-  const file = path.join(process.cwd(), "evals", "triage-tickets.json");
+  const file = path.join(process.cwd(), "evals", "triage.jsonl");
   const raw = await fs.readFile(file, "utf8");
-  const parsed = JSON.parse(raw) as FixtureFile;
-  return parsed.items;
+  return raw
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const sample = JSON.parse(line) as TriageSample;
+      return {
+        id: sample.id,
+        ticket: sample.input.ticket,
+        image_url: sample.input.image_url,
+        expected_category: sample.target.category,
+        expected_action: sample.target.action,
+        notes: sample.metadata?.notes,
+      };
+    });
 }
 
 async function loadEvalResults(): Promise<EvalResults | null> {

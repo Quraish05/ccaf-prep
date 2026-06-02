@@ -40,8 +40,11 @@ export type ToolCallRecord = {
   output: string;
 };
 
-// One ticket row from evals/triage-tickets.json. The UI's left rail and the
-// (future) eval harness both consume this shape.
+// Flattened ticket row used by the UI's left rail. The on-disk dataset
+// (evals/triage.jsonl) ships in Inspect-style {input, target, metadata}
+// form; page.tsx flattens each sample into this shape so the client
+// component doesn't need to know about the eval-side schema. The eval
+// route reads the JSONL directly without going through this type.
 export type TicketFixtureItem = {
   id: number;
   ticket: string;

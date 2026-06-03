@@ -22,7 +22,7 @@ Follow these steps EXACTLY:
 Do NOT skip step 1 — the test relies on observing the deny.`,
   tools: ["mcp__notes__save_note"],
   mcpServers: ["notes"],
-  model: "sonnet",
+  model: "haiku",
 };
 
 const TEST_BODY = `Customer Jane Doe (jane.doe@example.com, SSN 123-45-6789) reported a billing error on her March invoice.`;

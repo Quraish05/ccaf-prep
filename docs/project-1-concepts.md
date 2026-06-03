@@ -344,19 +344,24 @@ Item passes iff every criterion (shared + item) passes. Threshold: ≥4/5 items 
 ## 10. Models + profiles
 
 ### Model aliases the Agent SDK accepts `[ARCH][REL]`
-- `sonnet` — current Sonnet (default for searchers in PROD profile)
-- `opus` — current Opus (default for synthesiser in PROD profile)
-- `haiku` — current Haiku (every role in FAST profile)
-- Plus full model IDs like `claude-haiku-4-5-20251001`
+- `sonnet` — current Sonnet
+- `opus` — current Opus
+- `haiku` — current Haiku
+- Plus full model IDs like `claude-haiku-4-5-20251001` (required by the raw Messages API for the planner and the citation-bearing synth)
+
+The `resolveModelAlias` helper in `_lib.ts` maps each alias to its full ID so the raw SDK calls work regardless of which one the profile picks.
 
 ### Cheapest-model-that-meets-the-bar `[ARCH]`
 The exam's canonical model-selection rule. Don't default to Opus — pick the cheapest model that still passes your quality bar for that role.
 
-In this project:
-- **Plan step (PROD)** — Sonnet + extended thinking (the decomposition matters; pay for it once).
-- **Searchers (PROD)** — Sonnet (need WebSearch reasoning, but not Opus-level).
-- **Synthesiser (PROD)** — Opus (the report is the user-visible artifact).
-- **Everything (FAST profile, used for eval)** — Haiku across the board. Reads as ~10× cheaper, ~3× faster, ~20% lower quality.
+**In this project as currently configured**, both `PROD_PROFILE` and `FAST_PROFILE` default to **Haiku across every role** — affordability won the tradeoff for the prep work. The profile architecture still supports per-stage selection; flipping any role to Sonnet or Opus is a one-line change.
+
+The principled split (worth knowing for the exam scenario questions) would be:
+- **Plan step** — Sonnet + extended thinking when the decomposition quality matters (pay for it once per request).
+- **Searchers** — Sonnet when WebSearch reasoning + multi-step note-taking is the bottleneck; Haiku when speed/cost dominates.
+- **Synthesiser** — Opus when the report is the customer-facing artefact and prose quality matters; Haiku when the report is internal.
+
+The split that's *not* principled: defaulting everything to Opus. The exam tests for noticing when a cheaper model would have done the job.
 
 ### Cost/quality profiles `[ARCH]`
 Encoded as `ResearchProfile` in `_types.ts`:

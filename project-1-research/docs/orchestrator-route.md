@@ -178,7 +178,7 @@ const PLAN_THINKING_BUDGET = 4000;
 async function makePlan(userQuery: string): Promise<{ subQueries: string[]; thinking: string }> {
   const client = new Anthropic();
   const msg = await client.messages.create({
-    model: "claude-sonnet-4-6",
+    model: "claude-haiku-4-5",
     max_tokens: PLAN_THINKING_BUDGET + 1024,                       // must exceed budget_tokens
     thinking: { type: "enabled", budget_tokens: PLAN_THINKING_BUDGET },
     system: 'You break a research question into 3-5 ... Respond with JSON only: {"sub_queries": [...]}',
@@ -208,18 +208,18 @@ const SEARCHER_AGENT: AgentDefinition = {
   prompt: `You are a research searcher. ... call mcp__notes__save_note with title/body/source_url/sub_query ...`,
   tools: ["WebSearch", "mcp__notes__save_note"], // can search + write, cannot read
   mcpServers: ["notes"],
-  model: "sonnet",
+  model: "haiku",
 };
 
 const SYNTHESIZER_AGENT: AgentDefinition = {
   description: "Reads all gathered notes and writes the final research report.",
   prompt: `You are a research synthesizer. Call mcp__notes__recent_notes once ... write a ~1-page report ...`,
   tools: ["mcp__notes__recent_notes"],          // read-only, no web, no writes
-  model: "opus",
+  model: "haiku",
 };
 ```
 
-The `tools` arrays *are* the governance: searchers can write but not read each other's notes (isolation); the synthesizer can only read (no web, no mutation). Model choice follows cheapest-that-meets-the-bar — `sonnet` for many parallel searches, `opus` for the one report the user actually reads.
+The `tools` arrays *are* the governance: searchers can write but not read each other's notes (isolation); the synthesizer can only read (no web, no mutation). Both roles now default to **Haiku** — the project leans cheap by default. The `resolveModelAlias` map in `_lib.ts` still wires `"sonnet"` and `"opus"` to their full IDs, so upgrading any role's model for a quality run is a one-line change.
 
 ### `saveReport` — persist the markdown
 
@@ -280,7 +280,7 @@ const TEST_AGENT: AgentDefinition = {
   description: "Tests the PreToolUse PII guard ...",
   prompt: `... 1. attempt save_note with the raw PII content (will be blocked). 2. read the deny reason. 3. retry with PII replaced by [REDACTED]. 4. summarize.`,
   tools: ["mcp__notes__save_note"],   // no WebSearch — cheap + deterministic
-  model: "sonnet",
+  model: "haiku",
 };
 
 export async function POST() {

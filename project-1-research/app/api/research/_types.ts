@@ -43,6 +43,18 @@ export type SearcherSummary = {
   error: string | null;
 };
 
+// One footnote-style citation, deduplicated by source_url across the report.
+// Multiple cited spans in the report body that point at the same source URL
+// share the same `number`. `cited_text` is the exact substring of the source
+// note's body that supported the claim, returned by Anthropic's citations
+// API at no output-token cost.
+export type Citation = {
+  number: number;
+  source_url: string | null;
+  title: string;
+  cited_text: string;
+};
+
 export type ResearchResult = {
   subQueries: string[];
   planThinking: string;
@@ -50,6 +62,7 @@ export type ResearchResult = {
   notes: Note[];
   report: string | null;
   piiBlocks: PiiBlock[];
+  citations: Citation[];
 };
 
 // Optional lifecycle callbacks fired during runResearch — used by the

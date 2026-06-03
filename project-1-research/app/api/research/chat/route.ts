@@ -125,12 +125,19 @@ export async function POST(req: Request) {
             query,
             result.report,
             result.subQueries,
+            result.citations,
           );
           const filename = path.basename(filepath);
           writer.write({
             type: "tool-output-available",
             toolCallId: synthId,
-            output: { report_chars: result.report.length, filename },
+            // citations carried on the synth tool's output → page.tsx reads
+            // them from this part and renders the Sources footnote list.
+            output: {
+              report_chars: result.report.length,
+              filename,
+              citations: result.citations,
+            },
           });
 
           writer.write({ type: "text-start", id: textId });

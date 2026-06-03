@@ -13,6 +13,7 @@ import {
 import { z } from "zod";
 
 import type {
+  Citation,
   Note,
   PiiBlock,
   ResearchProfile,
@@ -21,6 +22,23 @@ import type {
   RunResearchEvents,
   SearcherSummary,
 } from "./_types";
+
+// The Agent SDK accepts model aliases natively for sub-agents
+// (sonnet/haiku/opus). The raw Messages API (used by makePlan and now by the
+// citation-aware synthesizer) needs full model IDs. Keep this map in sync
+// with the FAST_PROFILE / PROD_PROFILE shapes.
+function resolveModelAlias(alias: string): string {
+  switch (alias) {
+    case "haiku":
+      return "claude-haiku-4-5";
+    case "sonnet":
+      return "claude-sonnet-4-6";
+    case "opus":
+      return "claude-opus-4-7";
+    default:
+      return alias; // assume already a full id
+  }
+}
 
 export function buildNotesServer(
   notes: Note[],
@@ -149,6 +167,7 @@ export async function saveReport(
   userQuery: string,
   report: string,
   subQueries: string[],
+  citations: Citation[] = [],
 ): Promise<string> {
   await fs.mkdir(REPORTS_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -163,7 +182,21 @@ ${subQueries.map((q, i) => `${i + 1}. ${q}`).join("\n")}
 ---
 
 `;
-  await fs.writeFile(filepath, header + report, "utf8");
+  // Append a Sources footnote section so the .md downloaded via /api/research/download
+  // is self-contained — the [N] markers in the body resolve to a URL list at the end.
+  const footer =
+    citations.length > 0
+      ? "\n\n## Sources\n\n" +
+        citations
+          .map((c) => {
+            const label = c.source_url
+              ? `[${c.title}](${c.source_url})`
+              : c.title;
+            return `[${c.number}] ${label}`;
+          })
+          .join("\n")
+      : "";
+  await fs.writeFile(filepath, header + report + footer, "utf8");
   return filepath;
 }
 
@@ -270,11 +303,18 @@ export async function runAgent(
 
 // Cost/quality profiles ---------------------------------------------------
 
+// PROD now defaults to Haiku across every role — the same model FAST uses,
+// but without the searcher turn/sub-query caps. The bifurcation that
+// originally split PROD (Sonnet/Opus) from FAST (Haiku) is preserved
+// structurally so per-role model selection is still a one-line change;
+// the defaults just lean cheap. resolveModelAlias still maps "sonnet" and
+// "opus" to their full IDs, so flipping back to a heavier profile only
+// requires editing the strings below.
 export const PROD_PROFILE: ResearchProfile = {
-  planModel: "claude-sonnet-4-6",
+  planModel: "claude-haiku-4-5",
   planThinkingBudget: 4000,
-  searchModel: "sonnet",
-  synthModel: "opus",
+  searchModel: "haiku",
+  synthModel: "haiku",
 };
 
 // Cheap profile for evals: Haiku everywhere, no extended thinking, capped.
@@ -346,14 +386,15 @@ Run WebSearch with 1-3 well-chosen queries. For every distinct fact, quote, stat
 
 Aim for 3-6 notes. When done, reply with a one-paragraph summary of what you found and any gaps.`;
 
-const SYNTHESIZER_PROMPT = `You are a research synthesizer. Call mcp__notes__recent_notes exactly once to read every note the searchers gathered, then write a coherent report that answers the original research question.
+const SYNTHESIZER_SYSTEM = `You are a research synthesizer. The user message attaches every note the searcher sub-agents gathered, each as its own document. Write a coherent report that answers the original research question.
+
+For every factual claim, statistic, quote, or specific detail in the report, cite the note that supports it via the citations mechanism — the citations API will attach structured citation metadata to the relevant spans. Connective tissue (transitions, framing) does not need citations.
 
 The report MUST:
 - Target roughly 1 page (~500-800 words). Be substantive but not bloated.
-- Open with a 2-3 sentence executive summary
-- Use markdown headings for major sections
-- Cite sources inline as [title](url) where available
-- End with a "## Sources" section listing every URL referenced`;
+- Open with a 2-3 sentence executive summary.
+- Use markdown headings for major sections.
+- Read as natural prose. Do NOT include [N] markers, footnote numbers, or a "Sources" section in the body — the UI renders citations + sources automatically from the structured citation metadata you produce.`;
 
 function searcherAgent(profile: ResearchProfile): AgentDefinition {
   return {
@@ -367,14 +408,133 @@ function searcherAgent(profile: ResearchProfile): AgentDefinition {
   };
 }
 
-function synthesizerAgent(profile: ResearchProfile): AgentDefinition {
-  return {
-    description: "Reads all gathered notes and writes the final research report.",
-    prompt: SYNTHESIZER_PROMPT,
-    tools: ["mcp__notes__recent_notes"],
-    mcpServers: ["notes"],
-    model: profile.synthModel,
-  };
+// Synthesizer — raw Messages API with citable documents -------------------
+//
+// Each note becomes a `document` content block with `citations: { enabled: true }`.
+// Anthropic's API chunks plain-text documents into sentences and returns
+// citation metadata pointing back to the cited span + the document_index.
+// We resolve document_index back to notes[i].source_url for the footnote
+// rendering downstream. Citations are *incompatible* with the Agent SDK
+// path (notes there flow via tool_use, not as input documents) — this is
+// why the synth moved off runAgent.
+
+async function synthesizeWithCitations(
+  userQuery: string,
+  subQueries: string[],
+  notes: Note[],
+  profile: ResearchProfile,
+): Promise<{ report: string; citations: Citation[] }> {
+  const client = new Anthropic();
+
+  // One document per note. document_index in the response = position in
+  // this array = position in `notes`. context carries the source URL +
+  // sub_query as metadata the model can see but won't be cited from
+  // (per the spec, only `source.content` is citable; `title` and `context`
+  // are not).
+  const documents = notes.map((n) => ({
+    type: "document" as const,
+    source: {
+      type: "text" as const,
+      media_type: "text/plain" as const,
+      data: n.body,
+    },
+    title: n.title.slice(0, 200),
+    context: [
+      n.source_url ? `source_url: ${n.source_url}` : null,
+      `sub_query: ${n.sub_query}`,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+    citations: { enabled: true },
+  }));
+
+  const subQueriesList = subQueries
+    .map((q, i) => `${i + 1}. ${q}`)
+    .join("\n");
+
+  const response = await client.messages.create({
+    model: resolveModelAlias(profile.synthModel),
+    max_tokens: 4096,
+    system: SYNTHESIZER_SYSTEM,
+    messages: [
+      {
+        role: "user",
+        content: [
+          ...documents,
+          {
+            type: "text",
+            text: `Original research question: ${userQuery}\n\nSub-queries covered:\n${subQueriesList}\n\nWrite the final report now, citing the attached documents for every factual claim.`,
+          },
+        ],
+      },
+    ],
+  });
+
+  return formatReportWithCitations(response.content, notes);
+}
+
+// Walk the response's text blocks. For each cited block, append `[N]`
+// markers and dedupe footnote numbers by source_url across the whole
+// report. Returns the assembled report body + the ordered citation list
+// the UI renders as the "Sources" footnote section.
+function formatReportWithCitations(
+  blocks: Anthropic.ContentBlock[],
+  notes: Note[],
+): { report: string; citations: Citation[] } {
+  const citations: Citation[] = [];
+  const keyToNumber = new Map<string, number>();
+  let report = "";
+
+  for (const block of blocks) {
+    if (block.type !== "text") continue;
+    let segment = block.text;
+
+    const blockCitations =
+      "citations" in block && Array.isArray(block.citations)
+        ? block.citations
+        : [];
+
+    if (blockCitations.length > 0) {
+      const markers: number[] = [];
+      for (const cit of blockCitations) {
+        // All citation variants (char_location / page_location / content_block_location /
+        // search_result_location) share document_index, document_title, and cited_text.
+        const c = cit as {
+          document_index: number;
+          document_title?: string | null;
+          cited_text?: string;
+        };
+        const note = notes[c.document_index];
+        const sourceUrl = note?.source_url ?? null;
+        const dedupKey = sourceUrl ?? `doc-${c.document_index}`;
+
+        let num = keyToNumber.get(dedupKey);
+        if (num === undefined) {
+          num = keyToNumber.size + 1;
+          keyToNumber.set(dedupKey, num);
+          citations.push({
+            number: num,
+            source_url: sourceUrl,
+            title: c.document_title ?? note?.title ?? "(untitled)",
+            cited_text: c.cited_text ?? "",
+          });
+        }
+        if (!markers.includes(num)) markers.push(num);
+      }
+      const markerStr = markers
+        .sort((a, b) => a - b)
+        .map((n) => `[${n}]`)
+        .join("");
+      // Place the markers immediately after the cited span (before any
+      // trailing whitespace), so they stay attached to the claim even when
+      // the rendered text wraps.
+      segment = segment.replace(/(\s*)$/, ` ${markerStr}$1`);
+    }
+
+    report += segment;
+  }
+
+  return { report, citations };
 }
 
 // Orchestrator ------------------------------------------------------------
@@ -432,26 +592,38 @@ export async function runResearch(
   });
 
   if (notes.length === 0) {
-    return { subQueries, planThinking, searcherSummaries, notes, report: null, piiBlocks };
+    return {
+      subQueries,
+      planThinking,
+      searcherSummaries,
+      notes,
+      report: null,
+      piiBlocks,
+      citations: [],
+    };
   }
 
-  const synthPrompt = `Original research question: ${userQuery}
-
-Sub-queries covered:
-${subQueries.map((q, i) => `${i + 1}. ${q}`).join("\n")}
-
-Write the final report now using mcp__notes__recent_notes.`;
+  // Synth moved off the Agent SDK to the raw Messages API so we can attach
+  // notes as `document` blocks with citations enabled. The trade-off: this
+  // path doesn't run through runAgent's PII/audit hooks. That's fine here
+  // because the synth makes no tool calls — there's nothing for the hooks
+  // to intercept; their job is already done at the searcher stage.
   events?.onSynthStart?.();
-  const synth = await runAgent(synthPrompt, synthesizerAgent(profile), notes);
-  events?.onSynthDone?.(synth.text.length);
-  piiBlocks.push(...synth.blocks);
+  const { report, citations } = await synthesizeWithCitations(
+    userQuery,
+    subQueries,
+    notes,
+    profile,
+  );
+  events?.onSynthDone?.(report.length);
 
   return {
     subQueries,
     planThinking,
     searcherSummaries,
     notes,
-    report: synth.text,
+    report,
     piiBlocks,
+    citations,
   };
 }

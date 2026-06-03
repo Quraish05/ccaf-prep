@@ -39,6 +39,7 @@ export async function POST(req: Request) {
       userQuery,
       result.report,
       result.subQueries,
+      result.citations,
     );
 
     return Response.json({
@@ -50,6 +51,7 @@ export async function POST(req: Request) {
       report: result.report,
       report_path,
       pii_blocks: result.piiBlocks,
+      citations: result.citations,
     });
   } catch (err) {
     console.error("[/api/research] failed", err);

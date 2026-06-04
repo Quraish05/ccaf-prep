@@ -36,12 +36,27 @@ type TriageResult = {
   error?: string;
 };
 
+type EstimateResult = {
+  input_tokens: number;
+  output_tokens_estimate: { min: number; max: number };
+  cost_cents: {
+    input: number;
+    output_min: number;
+    output_max: number;
+    total_min: number;
+    total_max: number;
+  };
+  error?: string;
+};
+
 export function TriageInbox({ tickets }: { tickets: TicketFixtureItem[] }) {
   const [selectedId, setSelectedId] = useState<number>(tickets[0]?.id ?? 0);
   const [draft, setDraft] = useState<string>(tickets[0]?.ticket ?? "");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<TriageResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [estimate, setEstimate] = useState<EstimateResult | null>(null);
+  const [estimating, setEstimating] = useState(false);
 
   const selected = tickets.find((t) => t.id === selectedId) ?? tickets[0];
 
@@ -50,6 +65,32 @@ export function TriageInbox({ tickets }: { tickets: TicketFixtureItem[] }) {
     setDraft(t.ticket);
     setResult(null);
     setError(null);
+    setEstimate(null);
+  };
+
+  const runEstimate = async () => {
+    setEstimating(true);
+    setEstimate(null);
+    try {
+      const res = await fetch("/api/triage/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticket: draft, image_url: selected.image_url }),
+      });
+      const data: EstimateResult = await res.json();
+      setEstimate(data);
+    } catch (e) {
+      setEstimate({
+        input_tokens: 0,
+        output_tokens_estimate: { min: 0, max: 0 },
+        cost_cents: {
+          input: 0, output_min: 0, output_max: 0, total_min: 0, total_max: 0,
+        },
+        error: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setEstimating(false);
+    }
   };
 
   const runTriage = async () => {
@@ -127,15 +168,51 @@ export function TriageInbox({ tickets }: { tickets: TicketFixtureItem[] }) {
               <span className="text-zinc-600">→</span>{" "}
               <span className="text-zinc-400">{selected.expected_action}</span>
             </div>
-            <button
-              type="button"
-              onClick={runTriage}
-              disabled={loading || !draft.trim()}
-              className="rounded-md bg-emerald-700 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {loading ? "Triaging…" : "Triage"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={runEstimate}
+                disabled={estimating || !draft.trim()}
+                className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm font-medium text-zinc-200 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                title="Predict input tokens + cost via messages.countTokens — no model call"
+              >
+                {estimating ? "Estimating…" : "Estimate"}
+              </button>
+              <button
+                type="button"
+                onClick={runTriage}
+                disabled={loading || !draft.trim()}
+                className="rounded-md bg-emerald-700 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {loading ? "Triaging…" : "Triage"}
+              </button>
+            </div>
           </div>
+          {estimate ? (
+            estimate.error ? (
+              <div className="mt-2 rounded border border-rose-700 bg-rose-950 p-2 text-xs text-rose-300">
+                Estimate failed: {estimate.error}
+              </div>
+            ) : (
+              <div className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded border border-zinc-800 bg-zinc-900 p-2 text-xs">
+                <span className="text-zinc-500">Predicted:</span>
+                <span className="font-mono text-zinc-200">
+                  {estimate.input_tokens.toLocaleString()} in
+                </span>
+                <span className="text-zinc-500">+</span>
+                <span className="font-mono text-zinc-400">
+                  {estimate.output_tokens_estimate.min}–{estimate.output_tokens_estimate.max} out
+                </span>
+                <span className="text-zinc-500">·</span>
+                <span className="font-mono text-emerald-300">
+                  ≈ ${(estimate.cost_cents.total_min / 100).toFixed(4)}–${(estimate.cost_cents.total_max / 100).toFixed(4)}
+                </span>
+                <span className="text-[10px] text-zinc-600">
+                  (Haiku 4.5, first-turn only — actual run may cost more if the loop iterates)
+                </span>
+              </div>
+            )
+          ) : null}
 
           <textarea
             value={draft}

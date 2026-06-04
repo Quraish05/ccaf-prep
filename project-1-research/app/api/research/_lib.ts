@@ -13,6 +13,7 @@ import {
 import { z } from "zod";
 
 import type {
+  AuditRecord,
   Citation,
   Note,
   PiiBlock,
@@ -215,17 +216,69 @@ const AUDIT_PATH = path.join(process.cwd(), "audit.jsonl");
 // PostToolUse fires AFTER the tool ran — it cannot block or rewrite the
 // call. To block, use a PreToolUse hook with permissionDecision: "deny".
 //
-// PostToolUse hook: one JSONL line per WebSearch call. Self-filters by
-// tool_name so it's safe to wire onto any sub-agent — the synthesizer
-// doesn't have WebSearch in its allowlist so it'll never trigger anyway.
+// Per-tool-use start times captured by the PreToolUse companion below.
+// Keyed by tool_use_id (unique per Agent SDK call). The PostToolUse hook
+// reads + deletes from this map to compute latency_ms. Module-scope is
+// safe here because tool_use_id is unique per sub-agent run.
+const toolStartTimes = new Map<string, number>();
+
+// PreToolUse companion: records when WebSearch starts so the post hook
+// can compute latency. Doesn't deny anything — pure timing capture.
+// Wired alongside the PII hook in PreToolUse below.
+export const captureWebSearchStartHook: HookCallback = async (input) => {
+  if (input.hook_event_name !== "PreToolUse") return {};
+  if (input.tool_name === "WebSearch" && input.tool_use_id) {
+    toolStartTimes.set(input.tool_use_id, Date.now());
+  }
+  return {};
+};
+
+// PostToolUse hook: one JSONL line per WebSearch call, in the unified
+// AuditRecord shape shared with project-2-triage. Self-filters by tool_name
+// so it's safe to wire onto any sub-agent — the synthesizer doesn't have
+// WebSearch in its allowlist so it'll never trigger anyway.
+//
+// Latency is computed against the timestamp captured by the PreToolUse
+// companion above. Token counts are left undefined — the Agent SDK doesn't
+// surface per-tool-call usage at the hook layer (that's at the
+// message-stream level). Future enrichment would add separate "api_call"
+// rows from the message stream to populate input_tokens / output_tokens.
 export const auditWebSearchHook: HookCallback = async (input) => {
   if (input.hook_event_name !== "PostToolUse") return {};
   if (input.tool_name !== "WebSearch") return {};
-  const entry = {
+
+  let latencyMs: number | undefined;
+  if (input.tool_use_id) {
+    const start = toolStartTimes.get(input.tool_use_id);
+    if (start !== undefined) {
+      latencyMs = Date.now() - start;
+      toolStartTimes.delete(input.tool_use_id);
+    }
+  }
+
+  // tool_response shape varies; best-effort stringify + clip for the
+  // output_preview field. Falls back to empty if the response isn't
+  // serialisable.
+  let outputPreview: string | undefined;
+  const resp = (input as { tool_response?: unknown }).tool_response;
+  if (resp !== undefined) {
+    try {
+      outputPreview = JSON.stringify(resp).slice(0, 200);
+    } catch {
+      outputPreview = String(resp).slice(0, 200);
+    }
+  }
+
+  const entry: AuditRecord = {
     ts: new Date().toISOString(),
+    request_id: (input as { session_id?: string }).session_id ?? "unknown",
+    kind: "tool_call",
     tool: input.tool_name,
-    input: input.tool_input,
     tool_use_id: input.tool_use_id,
+    input: input.tool_input,
+    output_preview: outputPreview,
+    latency_ms: latencyMs,
+    // input_tokens / output_tokens left undefined — see comment above.
   };
   try {
     await fs.appendFile(AUDIT_PATH, JSON.stringify(entry) + "\n", "utf8");
@@ -261,7 +314,11 @@ async function runAgentOnce(
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       hooks: {
-        PreToolUse: [{ hooks: [piiHook] }],
+        // PII guard first, then timing capture for the audit log. Hooks
+        // in the same matcher are called in order; if PII denies, the
+        // tool never runs and the timing hook's recorded start (if any)
+        // is just left in the map and overwritten on the next call.
+        PreToolUse: [{ hooks: [piiHook, captureWebSearchStartHook] }],
         PostToolUse: [{ hooks: [auditWebSearchHook] }],
       },
     },

@@ -110,6 +110,7 @@ export async function POST(req: Request) {
 
   try {
     for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const apiStart = Date.now();
       const res = await anthropic.messages.create({
         model: "claude-haiku-4-5",
         max_tokens: 2048,
@@ -124,6 +125,23 @@ export async function POST(req: Request) {
         // tool_choice defaults to "auto" — let the model classify, fetch, and
         // refund as needed. Forcing only fires below on the end_turn recovery
         // path, when the model tried to finish without the report.
+      });
+      const apiLatency = Date.now() - apiStart;
+      const apiUsage = res.usage;
+      // api_call audit row carries the full turn's usage + latency. Per-tool
+      // rows below reference the same `turn` so aggregation by turn doesn't
+      // double-count tokens.
+      await appendAudit({
+        ts: new Date().toISOString(),
+        request_id: requestId,
+        turn,
+        kind: "api_call",
+        tool: "messages.create",
+        latency_ms: apiLatency,
+        input_tokens: apiUsage.input_tokens,
+        output_tokens: apiUsage.output_tokens,
+        cache_creation_input_tokens: apiUsage.cache_creation_input_tokens ?? undefined,
+        cache_read_input_tokens: apiUsage.cache_read_input_tokens ?? undefined,
       });
 
       // Did the model emit submit_triage_report this turn? That's the terminal.
@@ -151,6 +169,7 @@ export async function POST(req: Request) {
           content:
             "You ended without calling submit_triage_report. Conclude now by calling submit_triage_report with the structured outcome of this triage. Do not call any other tool.",
         });
+        const forcedStart = Date.now();
         const forced = await anthropic.messages.create({
           model: "claude-haiku-4-5",
           max_tokens: 2048,
@@ -163,6 +182,21 @@ export async function POST(req: Request) {
             name: REPORT_TOOL,
             disable_parallel_tool_use: true,
           },
+        });
+        // The forced-recovery call counts as its own turn for audit purposes —
+        // turn + 1 so a downstream aggregator can distinguish it from the
+        // original turn that emitted end_turn.
+        await appendAudit({
+          ts: new Date().toISOString(),
+          request_id: requestId,
+          turn: turn + 1,
+          kind: "api_call",
+          tool: "messages.create:forced-recovery",
+          latency_ms: Date.now() - forcedStart,
+          input_tokens: forced.usage.input_tokens,
+          output_tokens: forced.usage.output_tokens,
+          cache_creation_input_tokens: forced.usage.cache_creation_input_tokens ?? undefined,
+          cache_read_input_tokens: forced.usage.cache_read_input_tokens ?? undefined,
         });
         const forcedReport = extractReport(forced);
         if (forcedReport === null) {
@@ -222,12 +256,18 @@ export async function POST(req: Request) {
             await appendAudit({
               ts: new Date().toISOString(),
               request_id: requestId,
+              turn,
               kind: "hook_block",
               tool: t.name,
               path: "hook-denied",
               hook: "refund-cap",
               reason: decision.reason,
               input: redactedInput,
+              // Parent api_call's usage is duplicated here so a single audit
+              // line is self-describing. Aggregation tools should group by
+              // `turn` to avoid double-counting.
+              input_tokens: apiUsage.input_tokens,
+              output_tokens: apiUsage.output_tokens,
             });
             return {
               type: "tool_result" as const,
@@ -237,7 +277,9 @@ export async function POST(req: Request) {
             };
           }
 
+          const dispatchStart = Date.now();
           const output = await dispatchTool(t.name, input, mcp);
+          const dispatchLatency = Date.now() - dispatchStart;
           const redactedInput = redactCardNumbers(t.input);
           const path = t.name === "issue_refund" ? "mcp" : "inline";
           toolCalls.push({
@@ -249,11 +291,15 @@ export async function POST(req: Request) {
           await appendAudit({
             ts: new Date().toISOString(),
             request_id: requestId,
+            turn,
             kind: "tool_call",
             tool: t.name,
             path,
             input: redactedInput,
             output_preview: output.slice(0, 200),
+            latency_ms: dispatchLatency,
+            input_tokens: apiUsage.input_tokens,
+            output_tokens: apiUsage.output_tokens,
           });
           return {
             type: "tool_result" as const,

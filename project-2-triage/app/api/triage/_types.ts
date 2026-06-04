@@ -72,19 +72,39 @@ export type EvalResults = {
   }>;
 };
 
-// One line in audit.jsonl. Two kinds:
+// One line in audit.jsonl. Three kinds:
 //   - "tool_call": a tool actually ran. input is the already-redacted args,
 //     output_preview is the first ~200 chars of the dispatch result.
 //   - "hook_block": the PreToolUse hook denied. hook identifies which guard
 //     fired; reason is the deny message fed back to the model.
+//   - "api_call": one messages.create round-trip. Carries the latency and
+//     token counts; tool_call rows from the same turn share the parent
+//     api_call's `turn` index so aggregation tools can sum tokens by turn
+//     without double-counting.
+//
+// Latency + token fields:
+//   - latency_ms: tool execution time for tool_call rows; full API
+//     round-trip time for api_call rows.
+//   - input_tokens / output_tokens: from the parent messages.create's
+//     `usage` field. Duplicated onto each tool_call row from the same turn
+//     so a single log line is self-describing; aggregate via `turn` to
+//     avoid double-counting.
+//   - cache_creation_input_tokens / cache_read_input_tokens: same shape
+//     as the SDK's usage object; useful for cost-attribution dashboards.
 export type AuditRecord = {
   ts: string;
   request_id: string;
-  kind: "tool_call" | "hook_block";
+  turn?: number;
+  kind: "tool_call" | "hook_block" | "api_call";
   tool: string;
   path?: "inline" | "mcp" | "hook-denied";
   input?: unknown;
   output_preview?: string;
   hook?: string;
   reason?: string;
+  latency_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
 };

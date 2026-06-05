@@ -43,6 +43,26 @@ export type SearcherSummary = {
   error: string | null;
 };
 
+// One line in audit.jsonl. Unified shape with project-2-triage so downstream
+// cost/perf dashboards can ingest both projects with one parser. This project
+// currently emits "tool_call" rows (one per WebSearch invocation via the
+// PostToolUse audit hook); a paired PreToolUse companion records start times
+// so latency_ms is populated. Token counts are left undefined here — the
+// Agent SDK doesn't expose per-tool-call usage at the hook layer; future
+// enrichment would add "api_call" rows at the message-stream level.
+export type AuditRecord = {
+  ts: string;
+  request_id: string;
+  kind: "tool_call" | "api_call";
+  tool: string;
+  tool_use_id?: string;
+  input?: unknown;
+  output_preview?: string;
+  latency_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+};
+
 // One footnote-style citation, deduplicated by source_url across the report.
 // Multiple cited spans in the report body that point at the same source URL
 // share the same `number`. `cited_text` is the exact substring of the source

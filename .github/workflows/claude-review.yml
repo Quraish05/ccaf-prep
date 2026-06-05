@@ -85,6 +85,39 @@ jobs:
           echo "Findings:"
           jq . findings.json
 
+      - name: Emit + upload audit.jsonl artifact
+        # Normalise review-stream.jsonl into the unified AuditRecord shape so
+        # project-3's CI runs are inspectable in the same format as project-1
+        # and project-2's audit.jsonl. Uploaded as a workflow artifact for
+        # 14-day retention — useful for cross-project cost / latency
+        # dashboards.
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          jq -c --arg req "${{ github.event.pull_request.number }}" '
+            select(.type == "result") | {
+              ts: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+              request_id: ("pr-" + $req),
+              kind: "api_call",
+              tool: "claude-code:/review-pr",
+              latency_ms: (.duration_ms // null),
+              input_tokens: (.usage.input_tokens // null),
+              output_tokens: (.usage.output_tokens // null),
+              cache_creation_input_tokens: (.usage.cache_creation_input_tokens // null),
+              cache_read_input_tokens: (.usage.cache_read_input_tokens // null)
+            }
+          ' review-stream.jsonl > audit.jsonl
+          echo "audit.jsonl preview:"
+          cat audit.jsonl
+
+      - name: Upload audit artifact
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-audit-pr-${{ github.event.pull_request.number }}
+          path: audit.jsonl
+          retention-days: 14
+
       - name: Post / update PR comment
         if: steps.gate.outputs.run == 'true'
         env:

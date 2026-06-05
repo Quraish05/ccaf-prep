@@ -1,41 +1,73 @@
-# Why three projects, not one?
+# cca-f-prep
 
-> Why did we create 3 small projects for this course plan? Why did we not come up with one project idea & implement all the certification-required concepts there in that one project?
+Three end-to-end Next.js + TypeScript projects built while preparing for the **Claude Certified Architect — Foundations** exam. Each project goes deep on a different surface of the Anthropic stack — multi-agent orchestration with MCP, governance + structured outputs, and Claude Code in CI — so the cert's five domains all get exercised in real running code rather than only in flashcards.
 
-Genuinely good question — and the answer matters because it reveals a tension in the plan worth being honest about.
+## Projects
 
-**Short version**: three projects optimises for the exam; one big project optimises for the portfolio. We picked the former because you said *"the focus to cover the topics required to clear the certificate still is our high priority."* Both choices are defensible.
+| # | Project | What it is | Cert domain it stress-tests | Live | Screenshot |
+| --- | --- | --- | --- | --- | --- |
+| 1 | [project-1-research](project-1-research/README.md) | Orchestrator-workers research agent: planner → parallel searcher sub-agents → synthesizer, all sharing an in-process MCP notes store. First-party Citations API in the synth step. | Agentic Architecture & Orchestration (~27%) · MCP | _not yet deployed_ | <a href="research-ui.png"><img src="research-ui.png" width="220" alt="Research orchestrator UI" /></a> |
+| 2 | [project-2-triage](project-2-triage/README.md) | Customer-support triage agent on the raw Messages API with a manual tool-use loop, forced `tool_choice` for structured output, PreToolUse hook for the refund cap, PCI redaction, vision, and a 16-sample Inspect-style eval. | Prompt Engineering & Structured Output · Context Management & Reliability | _not yet deployed_ | <a href="traige-full.png"><img src="traige-full.png" width="220" alt="Triage inbox UI" /></a> |
+| 3 | [project-3 (in-repo)](marketplaces/cca-prep/plugins/cca-toolkit) | Claude Code in CI: a `/review-pr` slash command + `claude-review.yml` GH Action that runs `claude -p` headlessly on every labeled PR, a PostToolUse typecheck hook that feeds errors back into the agent loop, and a deliberately-flawed admin route as the demo target. | Claude Code Configuration & Workflows | _CI artefact — see `.github/workflows/`_ | _screenshot pending — first `claude-review` bot PR comment_ |
 
-The longer version has three threads.
+Concept references live in [`docs/`](docs/): [project-1-concepts](docs/project-1-concepts.md), [project-2-concepts](docs/project-2-concepts.md), [project-3-concepts](docs/project-3-concepts.md), [six scenario patterns](docs/scenario-patterns.md), [MCP auth + sampling notes](docs/mcp-auth-sampling.md).
 
-## 1. The cert blueprint is structurally three surfaces, not one
+## How to run locally
 
-The Anthropic stack has three distinct deployment surfaces that the exam tests as separate skills:
+Both Next.js projects expect an `ANTHROPIC_API_KEY` in a project-level `.env`.
 
-- **Agent SDK** — you *build* with it.
-- **Claude Code** — you *use* it as a CLI / CI tool.
-- **MCP** — you *connect* things with it.
+```bash
+# Project 1 — research orchestrator
+cd project-1-research && npm install && npm run dev
+# open http://localhost:3000
 
-A single unified project will naturally lean toward one surface and short-change the others. Project 1 is Agent SDK + MCP territory. Project 3 is Claude Code + GitHub Actions territory — that one literally cannot live inside the same Next.js app as Project 1, because Claude Code is a separate CLI / agent product. If we'd unified, we'd have either skipped the Claude Code surface (the 20% domain) or shoe-horned it in awkwardly. Three projects map cleanly onto the three surfaces.
+# Project 2 — triage agent
+cd project-2-triage && npm install && npm run dev
+# open http://localhost:3000
+```
 
-## 2. Each project naturally maximises a different domain
+Project 3 isn't a runnable web app — it ships as a Claude Code plugin + a GitHub Actions workflow. Try it locally with:
 
-Look at where each one peaks:
+```bash
+# Inside Claude Code at the repo root
+/plugin install ./marketplaces/cca-prep
+# then /review-pr against your current branch
+```
 
-| Project | Cert domain it stress-tests most |
-| --- | --- |
-| **Research agent** | Agentic orchestration (27% — the biggest) |
-| **Triage agent** | Governance, hooks, evals, vision, structured output |
-| **Claude Code CI** | Claude Code config, plugins, sub-agents, headless mode |
+The GH Action fires automatically on any PR carrying the `claude-review` label, provided the repo has `ANTHROPIC_API_KEY` as a secret.
 
-A unified *"AI engineering platform"* with all these features would technically cover the same surface area, but the cognitive cost of architecting one coherent thing that does all of it is much higher than three small things that each go deep on one thing. For a two-week sprint with cert-deadline pressure, **time-to-confidence matters more than elegance**.
+## What I learned
 
-## 3. The honest concession
+Three sharp takeaways per project — the kind the exam tends to probe, and the kind worth being able to articulate cold.
 
-There *is* a real argument for one project. A single integrated system is more impressive to a recruiter, mirrors what a real architect would actually build, and exercises composition (sub-agents calling other agents, RAG feeding the triage agent, etc.) in a way three siloed projects don't. The exam doesn't test composition heavily, but real work does. If your priority were *"land a senior AI engineer role"* rather than *"pass the cert,"* I'd have steered toward one platform.
+### Project 1 — research orchestrator
+- **Orchestrator-workers earns its complexity only when sub-tasks are genuinely independent.** Parallel fan-out is the point — if step N+1 depends on step N's output, prompt-chaining is the right shape and the orchestrator pattern is overkill.
+- **Citations API beats prompt-based "ask the model to inline `[text](url)`".** The Citations API enforces `cited_text` offsets server-side, so attribution becomes verifiable rather than trusted. `cited_text` is also free in output tokens — there's no cost reason to skip it.
+- **In-process MCP via `InMemoryTransport` is the cheapest way to share state across sub-agents.** No subprocess, no network. The lesson is that MCP isn't only for cross-process boundaries — it's also a clean tool-bus inside one Node process.
 
-## The retrofit option
+### Project 2 — triage agent
+- **`tool_choice: { type: "tool", name: "..." }` is the canonical structured-output recipe.** Strict-mode JSON Schema is enforced server-side; if the model tries to `end_turn` without the structured tool, force-recover on a follow-up turn with the same `tool_choice`. The "no JSON, just call this tool" framing is more reliable than asking for JSON in prose.
+- **PreToolUse hooks belong outside the system prompt.** Policy enforcement that survives prompt injection (e.g. the refund-cap hook denying any `issue_refund` with `amount_cents > 50000`) is what actually fails closed — system-prompt rules don't, when the user message is hostile.
+- **`temperature: 0` is non-negotiable for evals.** One non-deterministic sample per pass masks real regressions. Production runs can tolerate jitter; eval runs cannot.
 
-The retrofit option you have right now: on **Day 13 (portfolio polish)**, instead of writing three separate READMEs, write **one top-level narrative** that frames the projects as modules of a single AI-engineering platform — research module, support module, CI module. Same code, much stronger story. Project 4 (the RAG study assistant) becomes the knowledge layer that ties them together. From the outside it reads as one coherent system. From the inside, you still got the cert-friendly breadth.
+### Project 3 — Claude Code in CI
+- **Headless `claude -p --output-format stream-json --dangerously-skip-permissions` is the CI-ready surface.** `jq -rs '[.[] | select(.type == "result")] | last | .result'` extracts the final reply from the event stream regardless of how chatty the run was; fallback to `[]` on invalid JSON keeps the workflow green when the model misbehaves.
+- **Slash-command frontmatter is per-command tool gating.** `allowed-tools: ["Read", "Grep", "Bash(git diff:*)"]` is the slash-command equivalent of agent tool gating — review tasks shouldn't have `Write` or `Edit` in scope; the matcher form (`Bash(git diff:*)`) lets in the diff fetch without opening up arbitrary shell.
+- **PostToolUse hooks inject feedback into the next turn via `hookSpecificOutput.additionalContext`.** Typecheck after every TS edit; pipe failures back into the agent loop so it self-corrects without user prompting. The hook script must be LF-only — CRLF endings kill `set -euo pipefail` silently and you get a hook that "runs" but does nothing.
 
-That's actually the move I'd make in your position: **keep the three codebases** (you're 11 days in, don't restructure), **unify the narrative**, **add Project 4 as the connective tissue** post-exam.
+## Design rationale
+
+Why three small projects instead of one unified platform? See [`docs/why-three-projects.md`](docs/why-three-projects.md) for the long form — short version: the exam tests three distinct deployment surfaces (Agent SDK, Claude Code, MCP), and a single unified project would naturally lean toward one and short-change the others.
+
+## Repo layout
+
+```
+cca-f-prep/
+├── README.md                       # this file
+├── project-1-research/             # Next.js — orchestrator agent
+├── project-2-triage/               # Next.js — triage agent
+├── marketplaces/cca-prep/          # Claude Code plugin (project-3 artefact)
+├── .github/workflows/              # claude-review.yml (project-3 artefact)
+├── .claude/                        # project-level CC config + hooks
+└── docs/                           # concept references + scenario patterns
+```

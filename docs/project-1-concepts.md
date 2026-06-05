@@ -363,6 +363,10 @@ The principled split (worth knowing for the exam scenario questions) would be:
 
 The split that's *not* principled: defaulting everything to Opus. The exam tests for noticing when a cheaper model would have done the job.
 
+### One-paragraph cheat sheet — when I'd pick each `[ARCH]`
+
+**Pick Haiku 4.5** ($1/$5 per MTok, 200K context, fastest) for high-volume or latency-sensitive work where intelligence isn't the bottleneck: classification, simple tool dispatch, eval judges, sub-agents you can fan out, anything routine you'd run at scale. **Pick Sonnet 4.6** ($3/$15, 1M context) as the *default* for general-purpose agentic work — best balance of reasoning and speed; coding agents, computer-use traces, anything where Opus would be overkill but Haiku might miss a subtle inference. **Pick Opus 4.7** ($5/$25, 1M context, adaptive thinking only) when intelligence is the bottleneck and pays back its 5× input / 5× output premium: long-horizon agentic loops where compounding context decisions matter, frontier coding that needs the model to think before acting, vision-heavy workloads (Opus 4.7 introduced high-res image input — long-edge up to 2576px), and the final-stage synthesizer in a multi-agent pipeline where prose quality is the customer-visible artefact. **Layer the Batches API** (`POST /v1/messages/batches`) on top of any of the three for **50% off all tokens** when latency doesn't matter — async, results within 24h, all features supported (vision, tools, prompt caching) — so bulk classification, overnight eval runs, retroactive labelling, anything non-interactive should go through it. The exam-canonical rule of thumb is *"cheapest model that meets the bar"*: Opus is the deliberate upgrade for the one stage where the premium pays for itself (project-1's synthesizer in PROD_PROFILE, for example), not the everywhere default — project-2 sits on Haiku for the whole loop because triage doesn't need more, and the Day-12 retry wrapper's Sonnet → Haiku chain is the same idea applied to fault tolerance.
+
 ### Cost/quality profiles `[ARCH]`
 Encoded as `ResearchProfile` in `_types.ts`:
 ```ts

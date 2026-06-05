@@ -33,7 +33,12 @@ import type {
   Customer,
   HookBlock,
   PreToolUseHook,
+  RefundRecord,
+  RefundsClientHandle,
+  RetryFallbackOptions,
+  RetryFallbackResult,
 } from "./_types";
+import { REPORT_TOOL } from "./_prompt";
 
 // ---------------------------------------------------------------------------
 // Path A — inline tool handlers
@@ -193,10 +198,32 @@ export function buildRefundCapHook(blocks: HookBlock[]): PreToolUseHook {
 // Path B — in-process MCP server hosting `issue_refund`
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Idempotency store for issue_refund
+// ---------------------------------------------------------------------------
+//
+// Module-scope Map keyed by `${customer_id}|${order_id}`. The MCP server
+// itself is built per-request (re-entrancy concerns — see project-1
+// lesson), but the idempotency store HAS to persist across requests for
+// the dedup to be useful: two POST /api/triage calls for the same order
+// must return the same refund_id. Survives process lifetime; restart
+// clears the dedup state (acceptable for the demo — a real implementation
+// would persist this to a payments-processor-side idempotency key store,
+// not in-memory).
+//
+// In a production refund flow you'd also pass an Idempotency-Key header
+// to the downstream payment provider (Stripe, etc.) so the SAME refund
+// request goes through at most once even if the network drops between
+// here and them. The two layers compose: this Map dedupes inside our
+// process; the provider's Idempotency-Key dedupes across the network.
+
+const refundIdempotency = new Map<string, RefundRecord>();
+
 // Factory rather than module-scope singleton — McpServer + InMemoryTransport
 // instances aren't safely re-entrant across concurrent requests (project-1
 // learned this the hard way with parallel searchers sharing one server). A
 // fresh server + transport pair per POST keeps each invocation isolated.
+// The idempotency store ABOVE stays at module scope so dedup spans requests.
 export function buildRefundsServer() {
   return createSdkMcpServer({
     name: "refunds",
@@ -204,7 +231,7 @@ export function buildRefundsServer() {
     tools: [
       tool(
         "issue_refund",
-        "Issue a refund for a customer order. SENSITIVE: only call after classify_ticket returns 'refund_request' AND fetch_customer confirms refund_eligible=true.",
+        "Issue a refund for a customer order. SENSITIVE: only call after classify_ticket returns 'refund_request' AND fetch_customer confirms refund_eligible=true. Idempotent on (customer_id, order_id) — calling twice for the same order returns the same refund_id with status='already_issued' rather than issuing two refunds.",
         {
           customer_id: z.string(),
           order_id: z.string(),
@@ -212,17 +239,40 @@ export function buildRefundsServer() {
           reason: z.string(),
         },
         async (args) => {
-          // Stub: a real impl would call Stripe / payment processor.
-          const refundId = `rfd_${Math.random().toString(36).slice(2, 10)}`;
+          const key = `${args.customer_id}|${args.order_id}`;
+          const existing = refundIdempotency.get(key);
+          if (existing) {
+            // Idempotent return — same refund_id, flagged so the agent
+            // knows this was a retry rather than a fresh issuance.
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify({
+                    ...existing,
+                    status: "already_issued",
+                    note: "Idempotent return: a refund for this (customer_id, order_id) was already issued. Returning the original refund_id.",
+                  }),
+                },
+              ],
+            };
+          }
+
+          // First time — issue + store.
+          const record: RefundRecord = {
+            refund_id: `rfd_${Math.random().toString(36).slice(2, 10)}`,
+            amount_cents: args.amount_cents,
+            reason: args.reason,
+            issued_at: new Date().toISOString(),
+            customer_id: args.customer_id,
+            order_id: args.order_id,
+          };
+          refundIdempotency.set(key, record);
           return {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify({
-                  refund_id: refundId,
-                  status: "issued",
-                  ...args,
-                }),
+                text: JSON.stringify({ ...record, status: "issued" }),
               },
             ],
           };
@@ -234,10 +284,7 @@ export function buildRefundsServer() {
 
 // Open an MCP client connected to a fresh refunds server over the in-memory
 // transport pair. Returns the client and a cleanup fn the route can defer.
-export async function connectRefundsClient(): Promise<{
-  client: Client;
-  close: () => Promise<void>;
-}> {
+export async function connectRefundsClient(): Promise<RefundsClientHandle> {
   const server = buildRefundsServer();
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -255,182 +302,8 @@ export async function connectRefundsClient(): Promise<{
   };
 }
 
-// ---------------------------------------------------------------------------
-// Tool schemas the model sees (both paths combined)
-// ---------------------------------------------------------------------------
-//
-// cache_control on the last tool definition caches the tool list + system
-// across loop turns (skill default). The 4096-token cache minimum on Opus 4.7
-// means this won't actually hit until the agent loop accumulates context —
-// the marker is correct placement, not an immediate win.
-export const TOOLS: Anthropic.Tool[] = [
-  {
-    name: "classify_ticket",
-    description:
-      "Classify a support ticket into a category. Returns one of: refund_request, bug_report, question, other.",
-    input_schema: {
-      type: "object",
-      properties: {
-        ticket: { type: "string", description: "Raw ticket body text." },
-      },
-      required: ["ticket"],
-    },
-  },
-  {
-    name: "fetch_customer",
-    description:
-      "Fetch a customer record by id. Returns plan, lifetime value, and refund eligibility.",
-    input_schema: {
-      type: "object",
-      properties: {
-        customer_id: {
-          type: "string",
-          description: "Customer id (e.g. 'cus_001').",
-        },
-      },
-      required: ["customer_id"],
-    },
-  },
-  {
-    name: "issue_refund",
-    description:
-      "Issue a refund. SENSITIVE: only call after classify_ticket says 'refund_request' and fetch_customer confirms refund_eligible=true. amount_cents MUST be <= 50000 (the $500 cap); larger amounts must be escalated, not refunded.",
-    input_schema: {
-      type: "object",
-      properties: {
-        customer_id: { type: "string" },
-        order_id: { type: "string" },
-        amount_cents: { type: "integer" },
-        reason: { type: "string" },
-      },
-      required: ["customer_id", "order_id", "amount_cents", "reason"],
-    },
-  },
-  // -------------------------------------------------------------------------
-  // The structured-output tool. Forcing the final emit through this tool via
-  // tool_choice: {type:"tool", name:"submit_triage_report"} is the canonical
-  // "structured output" pattern: the tool's input_schema *is* the response
-  // schema, and the model is required to produce arguments that satisfy it.
-  // strict:true tells the API to enforce the schema server-side.
-  // -------------------------------------------------------------------------
-  {
-    name: "submit_triage_report",
-    description:
-      "Submit the final triage report. Call this exactly ONCE, at the very end, after all other tools. This is the only acceptable way to conclude the interaction — the report's fields are the ticket's audit record.",
-    input_schema: {
-      type: "object",
-      properties: {
-        ticket_category: {
-          type: "string",
-          enum: ["refund_request", "bug_report", "question", "other"],
-          description: "The category returned by classify_ticket.",
-        },
-        customer_id: {
-          type: ["string", "null"],
-          description:
-            "Customer id if one was mentioned in the ticket, else null.",
-        },
-        action_taken: {
-          type: "string",
-          enum: [
-            "refund_issued",
-            "escalated",
-            "answered",
-            "closed_no_action",
-          ],
-          description: "What this triage run did with the ticket.",
-        },
-        refund: {
-          anyOf: [
-            {
-              type: "object",
-              properties: {
-                refund_id: { type: "string" },
-                amount_cents: { type: "integer" },
-                reason: { type: "string" },
-              },
-              required: ["refund_id", "amount_cents", "reason"],
-              additionalProperties: false,
-            },
-            { type: "null" },
-          ],
-          description:
-            "Refund details when action_taken='refund_issued', else null. amount_cents MUST be <= 50000.",
-        },
-        escalation_reason: {
-          type: ["string", "null"],
-          description:
-            "One short sentence stating why this was escalated. Required when action_taken='escalated'; null otherwise.",
-        },
-        summary: {
-          type: "string",
-          description: "One-paragraph audit summary for the support log.",
-        },
-      },
-      required: [
-        "ticket_category",
-        "customer_id",
-        "action_taken",
-        "refund",
-        "escalation_reason",
-        "summary",
-      ],
-      additionalProperties: false,
-    },
-    strict: true,
-    cache_control: { type: "ephemeral" },
-  },
-];
-
-// Name pulled into a const so the forced-tool-choice call and the
-// terminal-detection check in the route loop can't drift.
-export const REPORT_TOOL = "submit_triage_report";
-
-export const SYSTEM = `# Persona
-
-You are Aria, a Tier 1 customer support triage agent for Acme Cloud. You handle routine tickets autonomously and escalate the rest to a human agent cleanly. You are concise, professional, and policy-bound: you do not improvise around the rules below.
-
-# Order of operations
-
-For every ticket, in this order:
-
-1. Call \`classify_ticket\` on the raw ticket body.
-2. If the category is \`refund_request\` and the ticket mentions a customer id, call \`fetch_customer\` to check eligibility.
-3. Decide the action based on the policies below.
-4. If issuing a refund, call \`issue_refund\` with sensible \`amount_cents\` and \`reason\`.
-5. ALWAYS finish by calling \`submit_triage_report\` exactly once, with the structured outcome. This is the only acceptable way to end the interaction.
-
-# Refund policy
-
-- The maximum refund you are authorized to issue is **$500 USD (50_000 cents)**. Refunds at or below this cap are pre-approved when eligibility holds; refunds above this cap MUST be escalated, never issued.
-- Issue a refund (via \`issue_refund\`) only when ALL of these hold:
-  - \`classify_ticket\` returned \`refund_request\`
-  - \`fetch_customer\` returned \`refund_eligible: true\`
-  - The appropriate refund amount is ≤ 50_000 cents
-  - The ticket names an order id (or one can be unambiguously inferred)
-- If the customer didn't name a specific amount, infer a reasonable one from the ticket (typical order value) but never exceed the $500 cap.
-- If the customer NAMES a specific amount > $500, escalate — do NOT issue a smaller "partial" refund as a workaround. The named amount is what they're asking for; partial refunds are unauthorized.
-
-# Escalation policy
-
-Set \`action_taken = "escalated"\` and populate \`escalation_reason\` when ANY of the following:
-
-- The customer requests, or the situation warrants, a refund > $500.
-- \`fetch_customer\` returned \`refund_eligible: false\`.
-- The ticket is a refund_request but lacks both an order id and any way to infer one.
-- The category is \`bug_report\`, or is \`other\` and the customer's intent is unclear.
-- The customer expresses anger, threatens a chargeback or legal action, or explicitly asks for a human.
-
-\`escalation_reason\` must be one short sentence (≤ 25 words) naming the specific trigger above.
-
-# Final-output contract
-
-The structured fields you submit via \`submit_triage_report\` are the ticket's audit record. They must be self-consistent:
-
-- If \`action_taken = "refund_issued"\`, \`refund\` must be populated AND \`escalation_reason\` must be null.
-- If \`action_taken = "escalated"\`, \`refund\` must be null AND \`escalation_reason\` must be non-null.
-- For \`answered\` and \`closed_no_action\`, both \`refund\` and \`escalation_reason\` are null.
-- \`summary\` is one short paragraph for the human reviewer — what you saw, what you did, why.`;
+// TOOLS / REPORT_TOOL / SYSTEM live in ./_prompt — the model-facing
+// surface of the agent. _lib.ts keeps the runtime helpers below.
 
 // ---------------------------------------------------------------------------
 // Dispatch a tool_use block to the right path
@@ -497,3 +370,90 @@ export async function appendAudit(record: AuditRecord): Promise<void> {
     // Audit logging is best-effort — never let a disk error fail the triage.
   }
 }
+
+// ---------------------------------------------------------------------------
+// Retry + model-fallback wrapper for messages.create
+// ---------------------------------------------------------------------------
+//
+// Layered on top of the SDK's built-in retry to add:
+//   - Observable retry behaviour (we control + log each attempt).
+//   - Chain-style model fallback. The SDK retries the SAME model; this
+//     wrapper exhausts retries on the primary, then falls to the next
+//     model in the chain. Useful when a specific model tier is saturated.
+//   - Caller-supplied idempotency_key on each attempt so retries of the
+//     SAME logical call dedupe at the API.
+//
+// Only retries 429 (RateLimitError) and 529 (APIError with status === 529 —
+// the SDK doesn't ship a dedicated OverloadedError class). Other errors
+// bubble immediately — retrying 4xx auth/schema bugs wastes spend and
+// delays the real error from reaching the caller.
+
+// Haiku-first per the project's cost preference (Haiku-for-project-APIs).
+// Sonnet sits in the chain as the *fallback* for burst-overload spikes —
+// if Haiku rate-limits, traffic spills up to Sonnet rather than failing.
+// "Fall up under spike load" inverts the textbook Sonnet → Haiku graceful-
+// degradation pattern, but matches this project's traffic shape: most
+// triage calls are well within Haiku's headroom, and the rare overload
+// is what the fallback is for.
+const DEFAULT_MODEL_CHAIN = ["claude-haiku-4-5", "claude-sonnet-4-6"] as const;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function callWithRetryAndFallback(
+  anthropic: Anthropic,
+  params: Omit<Anthropic.MessageCreateParamsNonStreaming, "model">,
+  options: RetryFallbackOptions = {},
+): Promise<RetryFallbackResult> {
+  const modelChain = options.modelChain ?? DEFAULT_MODEL_CHAIN;
+  const maxAttempts = options.maxAttemptsPerModel ?? 3;
+  const initialBackoff = options.initialBackoffMs ?? 1000;
+  const maxBackoff = options.maxBackoffMs ?? 30_000;
+  const idempotencyKey = options.idempotencyKey;
+
+  const retryLog: RetryFallbackResult["retryLog"] = [];
+
+  for (const model of modelChain) {
+    let backoff = initialBackoff;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const message = await anthropic.messages.create(
+          { ...params, model },
+          idempotencyKey ? { idempotencyKey } : undefined,
+        );
+        return { message, modelUsed: model, attemptsUsed: attempt, retryLog };
+      } catch (err) {
+        // 429 has a dedicated class; 529 (overloaded) surfaces as a generic
+        // APIError with .status === 529. Check both.
+        const isRateLimit = err instanceof Anthropic.RateLimitError;
+        const isOverloaded =
+          err instanceof Anthropic.APIError && err.status === 529;
+        if (!isRateLimit && !isOverloaded) {
+          throw err;
+        }
+
+        const errMsg = err instanceof Error ? err.message : String(err);
+        retryLog.push({ model, attempt, error: errMsg, backoff_ms: backoff });
+
+        if (attempt < maxAttempts) {
+          await sleep(backoff);
+          backoff = Math.min(backoff * 2, maxBackoff);
+          continue;
+        }
+        // Attempts exhausted on this model — fall through to next model
+        // in the chain. The outer loop resets `backoff` + `attempt`.
+        break;
+      }
+    }
+  }
+
+  // Every model in the chain was exhausted by 429/529.
+  const summary = retryLog
+    .map((r) => `${r.model}#${r.attempt}: ${r.error}`)
+    .join(" | ");
+  throw new Error(
+    `All ${modelChain.length} model(s) in the chain exhausted after retries. Last errors: ${summary}`,
+  );
+}
+

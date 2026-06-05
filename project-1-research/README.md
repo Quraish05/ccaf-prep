@@ -2,6 +2,8 @@
 
 A Next.js + TypeScript demo of the **orchestrator-workers** workflow from Anthropic's *Building effective agents*: a planner decomposes a research question into sub-queries, parallel searcher sub-agents gather facts via `WebSearch` into an in-process MCP notes store, and a synthesizer sub-agent writes a one-page markdown report. Streamed end-to-end into a `useChat` UI with live sub-agent trace pills, the planner's extended-thinking block, and a Download-report button. Built as Project 1 of the CCA-F exam prep, exercising agentic architecture, MCP, hooks, evals, and streaming UI in one repo.
 
+> **Companion docs**: [`docs/project-1-concepts`](../docs/project-1-concepts.md) for the exam-style concept skim · [`docs/orchestrator-route.md`](docs/orchestrator-route.md) for the function-by-function code walkthrough.
+
 ## Screenshot
 
 <!-- Capture localhost:3000 mid-research: trace panel open with mixed running/done pills,

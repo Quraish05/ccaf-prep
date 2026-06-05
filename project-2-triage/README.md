@@ -1,6 +1,6 @@
 # Project 2 — Triage Agent
 
-> Branch: `feat/project-1-research` · Last updated: 2026-06-01
+> **Companion doc**: [`docs/project-2-concepts`](../docs/project-2-concepts.md) — exam-style skim of every concept this project demonstrates.
 
 ![Triage inbox demo UI](../traige-full.png)
 ![Triage inbox demo UI](../current-ticket-triage.png)

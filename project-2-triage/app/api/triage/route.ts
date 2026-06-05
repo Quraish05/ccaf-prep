@@ -10,18 +10,21 @@ import { randomUUID } from "node:crypto";
 
 import Anthropic from "@anthropic-ai/sdk";
 
-import type { HookBlock, ToolCallRecord } from "./_types";
+import type {
+  HookBlock,
+  RetryFallbackResult,
+  ToolCallRecord,
+} from "./_types";
 import {
   appendAudit,
   buildRefundCapHook,
+  callWithRetryAndFallback,
   connectRefundsClient,
   dispatchTool,
   MAX_TURNS,
   redactCardNumbers,
-  REPORT_TOOL,
-  SYSTEM,
-  TOOLS,
 } from "./_lib";
+import { REPORT_TOOL, SYSTEM, TOOLS } from "./_prompt";
 
 export const runtime = "nodejs";
 
@@ -86,6 +89,24 @@ export async function POST(req: Request) {
   const hookBlocks: HookBlock[] = [];
   const preToolUseHook = buildRefundCapHook(hookBlocks);
 
+  // Per-request cumulative usage. Each messages.create response contributes
+  // its usage object; we sum across the loop so the final response payload
+  // surfaces cache_read_input_tokens / cache_creation_input_tokens for the
+  // whole triage. Verification step in the docs reads these to confirm the
+  // multi-breakpoint cache is working.
+  const cumulativeUsage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  };
+  const addUsage = (u: Anthropic.Usage) => {
+    cumulativeUsage.input_tokens += u.input_tokens ?? 0;
+    cumulativeUsage.output_tokens += u.output_tokens ?? 0;
+    cumulativeUsage.cache_creation_input_tokens += u.cache_creation_input_tokens ?? 0;
+    cumulativeUsage.cache_read_input_tokens += u.cache_read_input_tokens ?? 0;
+  };
+
   const userContent: Anthropic.ContentBlockParam[] | string = imageUrl
     ? [
         { type: "image", source: buildImageSource(imageUrl) },
@@ -108,26 +129,63 @@ export async function POST(req: Request) {
     return block ? block.input : null;
   };
 
+  // Track which models served the run + cumulative retry count, so the
+  // response payload can surface fallback behaviour to the caller.
+  const retrySummary = {
+    total_attempts: 0,
+    models_used: new Set<string>(),
+    log: [] as RetryFallbackResult["retryLog"],
+  };
+  // Set → array converter for the JSON response. Inline helper because
+  // it's used only in the two return sites below.
+  const summarizeRetries = (s: typeof retrySummary) => ({
+    total_attempts: s.total_attempts,
+    models_used: Array.from(s.models_used),
+    retry_count: s.log.length,
+    log: s.log,
+  });
+
   try {
     for (let turn = 0; turn < MAX_TURNS; turn++) {
       const apiStart = Date.now();
-      const res = await anthropic.messages.create({
-        model: "claude-haiku-4-5",
-        max_tokens: 2048,
-        // temperature: 0 makes the eval reproducible — the same ticket should
-        // produce the same triage decision run after run. Non-determinism at
-        // the default temperature made one bad sample per pass mask real
-        // failure modes (e.g. partial-refund-as-workaround).
-        temperature: 0,
-        system: SYSTEM,
-        tools: TOOLS,
-        messages,
-        // tool_choice defaults to "auto" — let the model classify, fetch, and
-        // refund as needed. Forcing only fires below on the end_turn recovery
-        // path, when the model tried to finish without the report.
-      });
+      const callResult = await callWithRetryAndFallback(
+        anthropic,
+        {
+          max_tokens: 2048,
+          // temperature: 0 makes the eval reproducible — the same ticket should
+          // produce the same triage decision run after run. Non-determinism at
+          // the default temperature made one bad sample per pass mask real
+          // failure modes (e.g. partial-refund-as-workaround).
+          temperature: 0,
+          // Two cache_control breakpoints render in this order:
+          //   1) on the last tool definition (submit_triage_report, in _lib.ts) — caches tools
+          //   2) here, on the last system block — caches tools + system together
+          // Both writers and readers — first call writes; subsequent calls hit
+          // cache_read_input_tokens > 0 in the usage object below. Haiku 4.5
+          // requires a minimum cacheable prefix of 4096 tokens; if the
+          // tools+system prefix is smaller, the cache silently won't write and
+          // input_tokens stays full-price across calls.
+          system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+          tools: TOOLS,
+          messages,
+          // tool_choice defaults to "auto" — let the model classify, fetch, and
+          // refund as needed. Forcing only fires below on the end_turn recovery
+          // path, when the model tried to finish without the report.
+        },
+        {
+          // Per-turn idempotency key — retries of the SAME turn dedupe at
+          // the API. Different turns get different keys so the agent loop
+          // can advance normally.
+          idempotencyKey: `${requestId}-turn-${turn}`,
+        },
+      );
+      const res = callResult.message;
       const apiLatency = Date.now() - apiStart;
       const apiUsage = res.usage;
+      addUsage(apiUsage);
+      retrySummary.total_attempts += callResult.attemptsUsed;
+      retrySummary.models_used.add(callResult.modelUsed);
+      retrySummary.log.push(...callResult.retryLog);
       // api_call audit row carries the full turn's usage + latency. Per-tool
       // rows below reference the same `turn` so aggregation by turn doesn't
       // double-count tokens.
@@ -156,6 +214,8 @@ export async function POST(req: Request) {
           hook_blocks: hookBlocks,
           turns: turn + 1,
           forced_recovery: false,
+          usage: cumulativeUsage,
+          retries: summarizeRetries(retrySummary),
         });
       }
 
@@ -170,19 +230,32 @@ export async function POST(req: Request) {
             "You ended without calling submit_triage_report. Conclude now by calling submit_triage_report with the structured outcome of this triage. Do not call any other tool.",
         });
         const forcedStart = Date.now();
-        const forced = await anthropic.messages.create({
-          model: "claude-haiku-4-5",
-          max_tokens: 2048,
-          temperature: 0,
-          system: SYSTEM,
-          tools: TOOLS,
-          messages,
-          tool_choice: {
-            type: "tool",
-            name: REPORT_TOOL,
-            disable_parallel_tool_use: true,
+        const forcedResult = await callWithRetryAndFallback(
+          anthropic,
+          {
+            max_tokens: 2048,
+            temperature: 0,
+            system: [{ type: "text", text: SYSTEM, cache_control: { type: "ephemeral" } }],
+            tools: TOOLS,
+            messages,
+            tool_choice: {
+              type: "tool",
+              name: REPORT_TOOL,
+              disable_parallel_tool_use: true,
+            },
           },
-        });
+          {
+            // Distinct idempotency key for the forced-recovery branch —
+            // retrying the recovery call deduces, but the API doesn't
+            // confuse it with the parent turn that emitted end_turn.
+            idempotencyKey: `${requestId}-turn-${turn}-forced`,
+          },
+        );
+        const forced = forcedResult.message;
+        retrySummary.total_attempts += forcedResult.attemptsUsed;
+        retrySummary.models_used.add(forcedResult.modelUsed);
+        retrySummary.log.push(...forcedResult.retryLog);
+        addUsage(forced.usage);
         // The forced-recovery call counts as its own turn for audit purposes —
         // turn + 1 so a downstream aggregator can distinguish it from the
         // original turn that emitted end_turn.
@@ -216,6 +289,8 @@ export async function POST(req: Request) {
           hook_blocks: hookBlocks,
           turns: turn + 2,
           forced_recovery: true,
+          usage: cumulativeUsage,
+          retries: summarizeRetries(retrySummary),
         });
       }
 

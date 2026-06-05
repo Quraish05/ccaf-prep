@@ -63,8 +63,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
+          # --verbose required when combining --print with --output-format stream-json
+          # (CLI constraint surfaces as exit-1 without this).
           claude -p "/review-pr" \
             --output-format stream-json \
+            --verbose \
             --permission-mode bypassPermissions \
             --dangerously-skip-permissions \
             > review-stream.jsonl

@@ -1,5 +1,8 @@
 // Shared types for this folder.
 
+import type Anthropic from "@anthropic-ai/sdk";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+
 // Domain type returned by fetchCustomer and consumed across the agent loop.
 export type Customer = {
   id: string;
@@ -107,4 +110,65 @@ export type AuditRecord = {
   output_tokens?: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+};
+
+// Single refund issuance, stored in the module-scope idempotency Map
+// keyed by `${customer_id}|${order_id}`. Returned (with status flag) from
+// the issue_refund MCP tool whether the call is a fresh issuance or an
+// idempotent re-return.
+export type RefundRecord = {
+  refund_id: string;
+  amount_cents: number;
+  reason: string;
+  issued_at: string;
+  customer_id: string;
+  order_id: string;
+};
+
+// Return shape of connectRefundsClient(): the MCP Client plus the cleanup
+// callback the route should defer with finally { await close() }. The two
+// fields are returned together because the close hides the underlying
+// server.instance.close() — callers should treat them as one handle.
+export type RefundsClientHandle = {
+  client: Client;
+  close: () => Promise<void>;
+};
+
+// Caller-tunable knobs for callWithRetryAndFallback. All fields are
+// optional; the wrapper applies project defaults (3 attempts per model,
+// 1s initial backoff doubling to 30s cap, model chain Sonnet → Haiku).
+export type RetryFallbackOptions = {
+  /** Models to try in order. First entry is the primary. */
+  modelChain?: readonly string[];
+  /** Max retries PER MODEL on 429/529 before falling to the next model. */
+  maxAttemptsPerModel?: number;
+  /** Initial backoff in ms; doubles every attempt, capped at maxBackoffMs. */
+  initialBackoffMs?: number;
+  /** Hard ceiling on a single sleep between retries. */
+  maxBackoffMs?: number;
+  /**
+   * Idempotency key passed to the API on every attempt. Retries of the
+   * SAME logical call use the SAME key so the API dedupes them.
+   * Different turns / different agent invocations get different keys.
+   */
+  idempotencyKey?: string;
+};
+
+// What callWithRetryAndFallback returns. The retryLog is populated whenever
+// at least one retry happened; on a first-attempt success it's empty.
+// retryLog's element shape is kept anonymous — referenced via
+// RetryFallbackResult["retryLog"] where needed (route.ts).
+export type RetryFallbackResult = {
+  message: Anthropic.Message;
+  /** Which model in the chain finally produced the message. */
+  modelUsed: string;
+  /** 1 = first attempt succeeded; 2 = one retry was needed; etc. */
+  attemptsUsed: number;
+  /** Per-model attempt history — populated whenever there was at least one retry. */
+  retryLog: Array<{
+    model: string;
+    attempt: number;
+    error: string;
+    backoff_ms: number;
+  }>;
 };

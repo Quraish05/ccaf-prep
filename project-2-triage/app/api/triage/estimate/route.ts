@@ -10,7 +10,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 
-import { REPORT_TOOL, SYSTEM, TOOLS } from "../_lib";
+import { REPORT_TOOL, SYSTEM, TOOLS } from "../_prompt";
 
 export const runtime = "nodejs";
 
